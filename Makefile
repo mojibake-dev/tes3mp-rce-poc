@@ -52,7 +52,24 @@ $(CRABNET_SRC)/.git:
 # libstdc++/libc++ no longer pull them in, so force-include them. Without <cstdint>,
 # Source/Utils/_FindFirst.h fails on 'intptr_t'; without <cstdlib>, DS_MemoryPool.h fails on
 # 'malloc'/'free'; <cstring> covers the memcpy/strlen family for the same reason.
-CRABNET_CXXFLAGS ?= -include cstdint -include cstdlib -include cstring
+#
+# -fwrapv -fno-strict-aliasing are REQUIRED with clang (macOS). CrabNet's congestion control
+# (CCRakNetSlidingWindow) does signed-overflow arithmetic on ACK/sequence numbers, which is UB;
+# clang -O2 "proves" the UB and replaces ShouldSendACKs() with __builtin_trap() (brk #1), so the
+# background update thread SIGTRAPs the moment real packets flow to a reachable host. -fwrapv makes
+# signed overflow defined and stops the miscompile. GCC does not need it, but it is harmless there.
+CRABNET_CXXFLAGS ?= -include cstdint -include cstdlib -include cstring -fwrapv -fno-strict-aliasing
+
+# clang (macOS) miscompiles CrabNet's congestion control (CCRakNetSlidingWindow::ShouldSendACKs) at -O2
+# and -O1 into a bare __builtin_trap (brk #1): the background update thread SIGTRAPs the instant real
+# packets flow to a reachable host. -fwrapv/-fno-strict-aliasing do not stop it; only dropping to -O0
+# does. GCC compiles it correctly at -O2 (the proven Linux build), so switch the CrabNet optimisation
+# level by compiler. Irrelevant to runtime: this is a two-connection client, not a throughput path.
+# The per-config override keeps CMAKE_BUILD_TYPE=RelWithDebInfo (so the library name has no 'd' suffix).
+CRABNET_OPT := -O2
+ifneq (,$(findstring clang,$(shell $(CXX) --version 2>/dev/null)))
+  CRABNET_OPT := -O0
+endif
 
 # CrabNet's bundled CmakeIncludes/PVS-Studio.cmake declares cmake_minimum_required(VERSION 2.8.12),
 # and CMake 4.x removed compatibility with < 3.5. It is included unconditionally (CMakeLists.txt:44),
@@ -65,6 +82,7 @@ $(CRABNET_LIB): | $(CRABNET_SRC)/.git
 	      $(CMAKE_COMPAT) \
 	      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 	      -DCMAKE_CXX_FLAGS="$(CRABNET_CXXFLAGS)" \
+	      -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="$(CRABNET_OPT) -g -DNDEBUG" \
 	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 	      -DCRABNET_ENABLE_SAMPLES=OFF \
 	      -DCRABNET_ENABLE_DLL=OFF \

