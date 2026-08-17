@@ -121,8 +121,39 @@ re-read those three values, and re-pin CrabNet to whatever that release links
 ```
 
 Two client connections are used: **A** performs the attack, **R** sits in the same cell and receives the
-relayed packets that carry the leaked bytes. On one host they are separated by `-b`; in a real attack they
-would simply be two connections.
+relayed packets that carry the leaked bytes. Both default to binding "any", so on one host they are just
+two source ports from the same address; `-b` overrides the reader's bind only if you need a fixed one.
+
+### Probe first (and mind the crash)
+
+The full chain **crashes the target a few seconds after it succeeds** — `strlen` stays pointed at `system`,
+so the next string operations inside the server run garbage. That is inherent to the technique, not a bug,
+and it is independent of the payload: a marker `touch` crashes it just as a shell does. So do not point the
+full run at a server you are not willing to see go down and restart.
+
+`--probe` exists for exactly this. It connects both clients, completes the handshake (including the server
+password), joins a cell, reports that it reached the point where the exploit would begin, and **stops
+without touching server memory**. Run it first to confirm a target is reachable and your `-P` is right,
+safely, against even a live server:
+
+```sh
+./tes3mp-rce -P 'server-password' --probe -v game.example.net
+# [+] fingerprinted 154 required data files
+# [+] both clients POSTLOADED in ExploitCell (no account, never logged in)
+# [probe] reachable and handshake accepted. Both clients are in-cell.
+```
+
+If the probe reaches `POSTLOADED`, the full run (drop `-p`, set `-c`) will fire.
+
+### Reachability notes
+
+* **`ping` lies.** Many servers drop ICMP while the game's UDP port is open (it has to be, for players).
+  A failed `ping` says nothing; the probe is the real reachability test.
+* **Split-horizon DNS.** A hostname may resolve to an internal address on the LAN and a public one from
+  outside. If the internal address is firewalled off but the public one hairpins, or vice versa, try both.
+  Point the exploit at whichever address the probe actually reaches.
+* **The game port is UDP.** SSH working (TCP/22) tells you nothing about whether UDP/25565 is reachable;
+  they are usually governed by different firewall rules.
 
 **Payloads should exit 0, and anything long-running must be backgrounded.** After the overwrite, `strlen`
 returns the command's exit status, and that value is used as a string length elsewhere in the server, so a
