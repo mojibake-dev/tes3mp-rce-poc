@@ -387,6 +387,11 @@ static uint64_t remoteLibcBase(Cli &A, Cli &R, uint64_t eq, const char *cell, ui
 // it from the distro's own libc packages. Unknown builds fall back to --libc / --system-off.
 struct GlibcBuild { uint64_t malloc_off, system_off; const char *note; };
 static GlibcBuild g_glibc[] = {
+    // Ubuntu 24.04, glibc 2.39-0ubuntu8.x. Offsets read from the public libc6 packages, keyed by malloc's
+    // offset (which we compute remotely). system's offset is what we actually need. Extend as builds appear.
+    { 0xad640, 0x58740, "glibc 2.39-0ubuntu8.0-8.3 (Ubuntu 24.04)" },
+    { 0xad650, 0x58750, "glibc 2.39-0ubuntu8.4-8.6 (Ubuntu 24.04)" },
+    { 0xad670, 0x58750, "glibc 2.39-0ubuntu8.7 (Ubuntu 24.04)" },
     { 0xad750, 0x58750, "glibc 2.39-0ubuntu8.8 (Ubuntu 24.04)" },
 };
 
