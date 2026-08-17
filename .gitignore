@@ -2,3 +2,5 @@ tes3mp-rce
 *.o
 *.out
 third_party/CrabNet/
+tools/__pycache__/
+*.pyc
