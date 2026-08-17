@@ -51,23 +51,49 @@ commitHash`, identical for every stock client of a given build, and is a version
 
 ## Build
 
-Needs the RakNet/CrabNet headers and static library that the TES3MP build links, plus the TES3MP source
-tree for `components/openmw-mp/NetworkMessages.hpp`.
-
 ```sh
-make RAKNET_DIR=/path/to/raknet TES3MP_SRC=/path/to/TES3MP
+make
 ```
 
-`RAKNET_DIR` must contain `include/raknet/RakPeerInterface.h` and `lib/libRakNetLibStatic.a`.
-Defaults match the author's lab (`/srv/fuzz/tes3mp/raknet`, `/srv/fuzz/tes3mp/src/TES3MP`).
+That is the whole thing. On first run it clones **CrabNet** (TES3MP's RakNet fork) at the exact commit
+TES3MP 0.8.1 links, builds only its static library, and then builds the exploit. Takes a few minutes once,
+then seconds thereafter.
 
-The equivalent one-liner, if you would rather skip make:
+Requires `g++` (C++17), `cmake`, `make`, `git`, and **network access for the first build only**.
+
+### What it depends on, and why you do not have to go and get it
+
+| Dependency | How it is handled |
+|---|---|
+| `NetworkMessages.hpp` (the packet-ID enum) | **vendored** in `third_party/tes3mp/`. It is the only file needed from TES3MP, so cloning a whole game engine for one enum would be silly. GPLv3, which is why this repo is GPLv3. |
+| CrabNet (RakNet fork: transport, `BitStream`, Huffman string compression) | **fetched and built by `make`**, pinned to commit `19e66190`. BSD licensed. Not vendored because it has to be *linked*, and the artefact is a 17 MB platform-specific `.a`. |
+
+The CrabNet pin is load-bearing: the wire format, reliability layer and string compressor must match what
+the target server links, or the client never completes a handshake.
+
+### Building offline, or against trees you already have
+
+Nothing is fetched if you point at existing checkouts:
 
 ```sh
-g++ -O2 -w -std=c++17 src/tes3mp-rce.cc -o tes3mp-rce \
-    -I/path/to/raknet/include/raknet -I/path/to/TES3MP \
-    -L/path/to/raknet/lib -lRakNetLibStatic -lpthread
+# an existing CrabNet checkout (built or not)
+make CRABNET_SRC=/path/to/CrabNet
+
+# a split headers/lib layout
+make RAKNET_INC=/path/to/raknet/include/raknet \
+     RAKNET_LIBDIR=/path/to/raknet/lib
 ```
+
+Other targets: `make deps` (dependencies only), `make clean`, `make distclean` (also removes
+`third_party/CrabNet`).
+
+### Targeting a different TES3MP version
+
+The connect token passed with `-t` is `TES3MP_VERSION + TES3MP_PROTO_VERSION + commitHash`, built from
+`components/openmw-mp/Version.hpp` and the release commit. For 0.8.1 that is
+`"0.8.1"` + `10` + `68954091c54d0596037c4fb54d2812313b7582a1`, i.e. the default. For another release,
+re-read those three values, and re-pin CrabNet to whatever that release links
+(`make CRABNET_COMMIT=<sha>`).
 
 ## Use
 

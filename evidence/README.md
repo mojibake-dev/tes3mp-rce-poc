@@ -12,3 +12,6 @@ An earlier version of `server-password-matrix.txt` was invalid because the `sed`
 the server password silently did not match, so all four cases ran against an unpassworded server. The
 retained run is the corrected one; the config line is echoed before each case so the setup is verifiable
 from the transcript itself.
+* `clean-clone-build.txt` — `make` from a pristine clone: CrabNet configured and built, exploit linked,
+  then that exact binary run against a passworded server, creating the marker file. Confirms the
+  documented build actually works rather than being plausible-looking instructions.
