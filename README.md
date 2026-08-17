@@ -18,6 +18,7 @@ the server runs under.
 | A user account password | **no** |
 | Any in-game rank, staff status, or privilege | **no** |
 | A prior login of any kind | **no** |
+| Any file from the target box | **no** — libc base is resolved over the wire; `system`'s per-build offset comes from a table of public distro packages (`--system-off`/`--libc` for a glibc not in it) |
 
 The distinction matters and is easy to get wrong. TES3MP has **two independent secrets**:
 
@@ -205,8 +206,13 @@ Seven steps; see `docs/CHAIN.md` for the full detail and the measured constants.
    permanently short, so it points at its own buffer). `base = leaked - 0x16F0`.
 4. **Image base.** Arbitrary read of `*(base-8)` gives `vtable for Player + 16`; subtract its RVA. Asserted
    page-aligned, so a bad read is rejected instead of being used.
-5. **libc base.** Arbitrary read of the resolved `malloc@got`. Deliberately not `strlen@got`: `strlen` is an
-   **IFUNC**, so its GOT holds the selected implementation, not the nominal symbol.
+5. **libc base — resolved remotely, no files.** Read `&malloc` from the resolved `malloc@got` (not
+   `strlen@got`: `strlen` is an **IFUNC**, so its GOT holds the selected implementation), then find libc's
+   base by masking `&malloc` down to a load alignment and confirming the `\x7fELF` magic. The read is
+   strlen-truncated so it cannot read a page-aligned *value* (a load base has a `0x00` low byte), but the
+   magic byte `0x7f` is readable, so this works where a `link_map` walk would not. `system`'s offset within
+   libc is per-build; it comes from a small table keyed on the remotely-computed malloc offset (filled from
+   public distro packages), or `--system-off`/`--libc` for a build not in the table.
 6. **Plant.** Aim `eq[7].refId` at `strlen@got`, with `capacity` set high enough that the assignment takes
    the in-place path rather than reallocating (which would `free()` the GOT address).
 7. **Execute.** One equipment packet carrying two **in-bounds** items: item 7's `refId` assignment writes
