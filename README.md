@@ -61,6 +61,8 @@ then seconds thereafter.
 
 Requires `g++` (C++17), `cmake`, `make`, `git`, and **network access for the first build only**.
 
+Builds on Linux (GCC 13+) and macOS (Apple clang). CrabNet is a 2020 codebase, so the Makefile force-includes `<cstdint> <cstdlib> <cstring>` (modern toolchains no longer pull them in transitively) and passes `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake 4.x dropped the pre-3.5 compatibility that CrabNet's bundled PVS-Studio module still declares). Both are handled for you; they are called out only so the cause is obvious if you re-run the cmake step by hand.
+
 ### What it depends on, and why you do not have to go and get it
 
 | Dependency | How it is handled |

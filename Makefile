@@ -48,14 +48,21 @@ $(CRABNET_SRC)/.git:
 
 # Static library only: the DLL and samples are not needed and roughly double the build.
 #
-# -include cstdint is REQUIRED on GCC 13+. CrabNet dates from 2020 and relies on <cstdint> arriving
-# transitively; newer libstdc++ no longer provides it, so Source/Utils/_FindFirst.h fails with
-# "'intptr_t' was not declared in this scope". This force-includes it rather than patching the tree.
-CRABNET_CXXFLAGS ?= -include cstdint
+# CrabNet dates from 2020 and relies on several standard headers arriving transitively; modern
+# libstdc++/libc++ no longer pull them in, so force-include them. Without <cstdint>,
+# Source/Utils/_FindFirst.h fails on 'intptr_t'; without <cstdlib>, DS_MemoryPool.h fails on
+# 'malloc'/'free'; <cstring> covers the memcpy/strlen family for the same reason.
+CRABNET_CXXFLAGS ?= -include cstdint -include cstdlib -include cstring
+
+# CrabNet's bundled CmakeIncludes/PVS-Studio.cmake declares cmake_minimum_required(VERSION 2.8.12),
+# and CMake 4.x removed compatibility with < 3.5. It is included unconditionally (CMakeLists.txt:44),
+# so the CRABNET_ENABLE_PVS=OFF option cannot avoid it. This tells CMake to proceed with a 3.5 floor.
+CMAKE_COMPAT ?= -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
 $(CRABNET_LIB): | $(CRABNET_SRC)/.git
 	@echo "==> building CrabNet static library (a few minutes, once)"
 	cmake -S $(CRABNET_SRC) -B $(CRABNET_SRC)/build \
+	      $(CMAKE_COMPAT) \
 	      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 	      -DCMAKE_CXX_FLAGS="$(CRABNET_CXXFLAGS)" \
 	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
