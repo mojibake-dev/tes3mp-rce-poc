@@ -199,29 +199,56 @@ both of which were observed.
 
 ---
 
-## 8. The shell against a sealed DMZ: socket reuse over UDP
+## 8. The shell against a sealed DMZ: the server's own script loader
 
-The production target's DMZ egress-filters: from that host, only DNS to the internal resolver is
-permitted; every new outbound TCP connection is dropped [NIST8041][OWASPEGRESS]. A classic reverse
-shell, which opens a new outbound connection, cannot work there, and that is the firewall behaving
+The production target's DMZ egress-filters: from that host only DNS to the internal resolver is
+permitted, and every new outbound TCP connection is dropped [NIST8041][OWASPEGRESS]. A classic reverse
+shell opens a new outbound connection, so it cannot work there, and that is the firewall behaving
 correctly.
 
 The way through is the channel that is open by definition: the inbound game flow. Stateful firewalls
-(here, pf keep-state) permit reply traffic that matches an existing connection's state, which is why
-the game's own server-to-client packets get out. So the payload does not open anything new; it
-**reuses the server's own UDP socket**.
+(here, pf keep-state) permit reply traffic matching an existing connection's state, which is why the
+game's own server-to-client packets get out at all. So the payload must not open anything new; it has to
+answer on the flow the player already established.
 
-Mechanically: `system()`'s child process inherits the server's file descriptors, including the UDP
-socket bound to `:25565` (verified not close-on-exec). The stager, delivered by `system()` and run
-detached with `setsid`, **outlives** the server it was injected into (which crashes seconds later per
-section 7), keeps that socket bound, and serves a small command protocol back to the operator's client
-over the very same socket. Replies match the established inbound 4-tuple, so they egress where a fresh
-`connect()` is dropped. This is the socket-reuse / "findsock" payload family [SKAPE][SHELLCODER],
-adapted to a shared, connectionless UDP socket, which is why it is a command channel (`id`, `cat`,
-`ls`) rather than a raw interactive PTY. Crucially it needs no instruction-pointer control: `system()`
-already gives arbitrary command execution, and the stager is just a command it runs.
+### 8.1 What did not work: socket reuse
 
----
+The first attempt was the textbook one. `system()`'s child inherits the server's file descriptors,
+including the UDP socket bound to `:25565` (verified not close-on-exec). A stager run detached with
+`setsid` should outlive the server it was injected into, which crashes seconds later per section 7, keep
+that socket bound, and answer a command protocol over it. Replies would match the established inbound
+4-tuple and egress where a fresh `connect()` is dropped. That is the socket-reuse / "findsock" payload
+family [SKAPE][SHELLCODER], adapted to a shared connectionless UDP socket.
+
+It fails on a systemd target, for a reason that is structural rather than incidental. The stager is a
+child of the server process, so it is placed in that unit's cgroup, and systemd's default
+`KillMode=control-group` kills the entire cgroup when the unit is stopped or restarted
+[SYSTEMDKILL]. The restart that the exploit provokes is therefore the same event that SIGKILLs the
+stager. Detaching with `setsid` changes the session, not the cgroup, so it does not help. The technique
+depends on outliving a crash, and on this platform the crash is precisely what reaps it.
+
+### 8.2 What worked: let the restart be the loader
+
+The fix is to stop fighting the restart and use it. TES3MP loads server-side Lua from
+`server/scripts/`, and `serverCore.lua` unconditionally `require`s `customScripts.lua`, a file whose
+entire purpose is listing operator-supplied modules. So the payload writes a Lua module into
+`scripts/custom/` and appends one `require` line to that list. Nothing executes yet. The server then
+crashes from the hijacked `strlen`, systemd restarts it about five seconds later, and the fresh process
+loads the module during ordinary startup.
+
+The result is strictly better than the stager on every axis that matters here. It runs inside a healthy
+process that owns the game socket rather than a doomed one squatting it, so the service keeps working
+for real players. It uses the server's own message API, a chat command in and command output back as
+server messages, so it needs no second socket and does not race the receive loop. It survives reboots,
+because it is loaded from disk by the normal startup path. And it needs no instruction-pointer control
+at any point: `system()` already gives arbitrary command execution, and the module is just a file that
+command writes.
+
+The cost is persistence in both directions. The module sits in the server's own script tree where any
+file listing or configuration-management converge will find it, and driving it requires a user account,
+because CoreScripts gates chat on `IsLoggedIn()`. Registering leaves a player file on disk. The
+memory-corruption chain in sections 1 through 7 creates neither artifact; this stage is the loud one, and
+that asymmetry is worth stating plainly in any report that uses it.
 
 ## 9. Why this took as long as it did
 
@@ -277,7 +304,9 @@ because the dead ends are the interesting part:
    4.x removed the pre-3.5 policy compatibility that CrabNet's bundled modules still declare.
 
 8. **The reverse shell could not phone home**, section 8, which was not a flaw in the exploit but a
-   correct property of the network, and needed the socket-reuse rework to get a shell despite it.
+   correct property of the network. The obvious answer, a socket-reuse stager, then failed for a second
+   structural reason: systemd's cgroup kill reaps the stager during the very restart it needs to survive.
+   Only the third approach, writing a module the server's own restart loads, worked.
 
 Read together, the theme is that a memory-corruption chain is only as strong as its least-understood
 link, and several links were subtle mechanisms in libstdc++, glibc, and RakNet that behave differently
@@ -350,6 +379,10 @@ Cited twice where a foundational source exists: first an accessible entry point,
   `find_tag` payload families. Accessible: Metasploit payload documentation.
 - **[SHELLCODER]** Anley, Heasman, Lindner, Richarte, *The Shellcoder's Handbook*, 2nd ed., 2007
   (the egress-restricted-target chapter).
+- **[SYSTEMDKILL]** Accessible: `systemd.kill(5)`, the `KillMode=` directive (default
+  `control-group`: on stop or restart systemd kills every remaining process in the unit's cgroup).
+  Foundational: the Linux kernel cgroup v2 documentation, `Documentation/admin-guide/cgroup-v2.rst`,
+  on cgroup membership being inherited by children and independent of session or process group.
 - **[NIST8041]** NIST SP 800-41 Rev. 1, *Guidelines on Firewalls and Firewall Policy* (egress
   filtering, DMZ design). Related control: NIST SP 800-53 SC-7, boundary protection.
 - **[OWASPEGRESS]** OWASP guidance on egress filtering.
@@ -394,9 +427,14 @@ Cited twice where a foundational source exists: first an accessible entry point,
 - **`system()`**: the libc function that runs a shell command string. The ultimate call target of the
   GOT overwrite.
 - **findsock / socket reuse**: a payload technique that reuses an already-open socket to talk to the
-  attacker, instead of opening a new connection. Essential against egress-filtered targets.
+  attacker, instead of opening a new connection. A standard answer to egress filtering, though not the
+  one that worked here (section 8.1).
 - **egress filtering**: firewall policy that restricts *outbound* connections. Here it blocks a reverse
-  shell and forces the socket-reuse approach.
+  shell, forcing the payload onto the inbound game flow the client already established.
+
+- **`KillMode=control-group`**: systemd's default, which kills every process remaining in a unit's
+  cgroup when that unit stops or restarts. It is why a detached child of the server does not outlive
+  the server's restart (section 8.1).
 - **4-tuple / stateful firewall / conntrack**: a connection is identified by (source IP, source port,
   destination IP, destination port). A stateful firewall remembers active flows and permits their
   replies; reusing the game flow's 4-tuple is how the shell's output escapes the DMZ.

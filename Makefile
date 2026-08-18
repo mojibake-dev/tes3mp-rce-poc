@@ -9,8 +9,8 @@
 # (third_party/CrabNet), so a clean clone builds with no manual dependency hunting.
 #
 # Already have the trees? Point at them instead and nothing is fetched:
-#   make CRABNET_SRC=/srv/fuzz/tes3mp/src/CrabNet CRABNET_LIB=/srv/fuzz/tes3mp/raknet/lib/libRakNetLibStatic.a
-#   make RAKNET_INC=/srv/fuzz/tes3mp/raknet/include/raknet RAKNET_LIBDIR=/srv/fuzz/tes3mp/raknet/lib
+#   make CRABNET_SRC=/path/to/CrabNet CRABNET_LIB=/path/to/libRakNetLibStatic.a
+#   make RAKNET_INC=/path/to/raknet/include/raknet RAKNET_LIBDIR=/path/to/raknet/lib
 
 CRABNET_REPO   ?= https://github.com/TES3MP/CrabNet.git
 CRABNET_COMMIT ?= 19e66190e83f53bcdcbcd6513238ed2e54878a21   # the fork+commit TES3MP 0.8.1 links

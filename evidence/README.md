@@ -1,17 +1,23 @@
 # Evidence
 
-* `rce-and-reverse-shell.txt` — gdb `break system` showing `system()` invoked with the attacker's exact
+* `rce-and-reverse-shell.txt`: gdb `break system` showing `system()` invoked with the attacker's exact
   string, the marker file on disk owned by the server's user, cold-start reliability, and the reverse-shell
   session (lab only; the disclosure PoC uses the marker payload).
-* `server-password-matrix.txt` — the four-way test: unpassworded server with no `-P` (executes);
+* `server-password-matrix.txt`: the four-way test: unpassworded server with no `-P` (executes);
   passworded server with no `-P`, with a wrong `-P`, and with the correct `-P`.
-* `passworded-server-rce.txt` — full run against a **passworded** server: rejected cleanly without `-P`,
+* `passworded-server-rce.txt`: full run against a **passworded** server: rejected cleanly without `-P`,
   full execution with it, and `account files created: 0` (no user account is ever involved).
+* `reverse-shell-passworded.txt`: the reverse-shell payload against a passworded server, showing the
+  interactive session (`id` -> the unprivileged service user, `hostname`, `pwd` -> the server's cwd).
+  Lab only; the disclosure PoC uses the marker payload.
+
+The server password is redacted to `<server-password>` throughout. The value used was the real setting on
+the lab server, echoed by the test harness before each case so the setup is verifiable from the transcript.
 
 An earlier version of `server-password-matrix.txt` was invalid because the `sed` that was supposed to set
 the server password silently did not match, so all four cases ran against an unpassworded server. The
 retained run is the corrected one; the config line is echoed before each case so the setup is verifiable
 from the transcript itself.
-* `clean-clone-build.txt` — `make` from a pristine clone: CrabNet configured and built, exploit linked,
+* `clean-clone-build.txt`: `make` from a pristine clone: CrabNet configured and built, exploit linked,
   then that exact binary run against a passworded server, creating the marker file. Confirms the
   documented build actually works rather than being plausible-looking instructions.
