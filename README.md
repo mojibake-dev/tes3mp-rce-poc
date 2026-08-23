@@ -126,6 +126,18 @@ modes
 -s, --shell                 re-entry mode. Drives an ALREADY-INSTALLED backdoor as an ordinary
                             client; exploits nothing. Interactive, or one-shot with -c.
 -A, --account-pass <pw>     account password for -s (default: rce-poc-pw-1)
+-O, --bot                   LOAD GENERATOR. Join a cell as an ordinary client and send in-bounds
+                            equipment changes forever. Exploits nothing. Exists so a second
+                            player's relays are present in the cell, which is the only way to
+                            test that the leak ignores other players' equipment.
+                            -I <ms> interval, -X <idx> the in-bounds index.
+
+target profile
+-F, --profile <file>        load a target profile: the class layout AND the image RVAs.
+                            tools/gen-profile derives the layout half from a TES3MP source tree
+                            with offsetof, so a new build is a regenerate rather than a
+                            re-measure. -B still wins for the RVA half, since the binary is
+                            ground truth for its own addresses.
 
 target overrides (only if the target is not stock 0.8.1 on Ubuntu 24.04)
 -B, --server-bin <path>     read vtable/strlen@got/malloc@got RVAs from a copy of the target's

