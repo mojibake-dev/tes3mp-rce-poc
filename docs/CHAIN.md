@@ -13,6 +13,30 @@ GNU_RELRO   0x2b5680 .. 0x2c3000       <- ends exactly where .got.plt begins
 JUMP_SLOT   301 entries
 ```
 
+### The RELRO line is a distro accident, not a decision (MEASURED 2026-08-23)
+
+TES3MP's `CMakeLists.txt` sets **no hardening flags at all** (only `-Wall -Wextra -Wundef -pedantic`,
+`:578`), so whether a given server is exposed is decided entirely by whose toolchain built it.
+Measured with a plain `g++ -O2` on a trivial file, no flags added, on the fuzz pool:
+
+| Host | Compiler | `GNU_RELRO` | `BIND_NOW` | `.got.plt` | Result |
+|---|---|---|---|---|---|
+| Ubuntu 24.04 | g++ 13 | yes | **yes** | **absent** | **full RELRO: immune** |
+| Debian 12 | g++ 12 | yes | no | present | partial RELRO: **exposed** |
+| shipped 0.8.1 release | Debian GCC 8.3 | yes | no | present | partial RELRO: **exposed** |
+
+So the same source, built by two people on two current distributions, produces one server this chain
+cannot touch and one it owns. The shipped release binary is on the exposed side, which is the only
+reason any of this works.
+
+Two consequences worth stating plainly. For an operator who cannot patch, **rebuilding from source on
+a modern Ubuntu is a complete mitigation on its own**, at zero code change, because the toolchain
+default alone removes the writable GOT. And for anyone writing a detector: testing whether `.got.plt`
+falls inside `GNU_RELRO` is **not sufficient**, because a full-RELRO link commonly emits no `.got.plt`
+section at all (eager binding leaves no lazy slots, so what remains folds into `.got`). The
+authoritative signal is `DT_BIND_NOW`, `DT_FLAGS & DF_BIND_NOW`, or `DT_FLAGS_1 & DF_1_NOW` in the
+dynamic table. `tes3mp-rce --server-bin` checks those and refuses.
+
 PIE and NX are on (toolchain defaults). Stack canary, FORTIFY and full RELRO are absent. `system` is
 **not** imported, so it has to come from libc, which is why a libc leak is needed at all.
 
