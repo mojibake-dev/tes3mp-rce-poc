@@ -21,7 +21,7 @@ Measured with a plain `g++ -O2` on a trivial file, no flags added, on the fuzz p
 
 | Host | Compiler | `GNU_RELRO` | `BIND_NOW` | `.got.plt` | Result |
 |---|---|---|---|---|---|
-| Ubuntu 24.04 | g++ 13 | yes | **yes** | **absent** | **full RELRO: immune** |
+| Ubuntu 24.04 | g++ 13 | yes | **yes** | **absent** | full RELRO: **executable GOT closed** |
 | Debian 12 | g++ 12 | yes | no | present | partial RELRO: **exposed** |
 | shipped 0.8.1 release | Debian GCC 8.3 | yes | no | present | partial RELRO: **exposed** |
 
@@ -29,9 +29,22 @@ So the same source, built by two people on two current distributions, produces o
 cannot touch and one it owns. The shipped release binary is on the exposed side, which is the only
 reason any of this works.
 
-Two consequences worth stating plainly. For an operator who cannot patch, **rebuilding from source on
-a modern Ubuntu is a complete mitigation on its own**, at zero code change, because the toolchain
-default alone removes the writable GOT. And for anyone writing a detector: testing whether `.got.plt`
+~~For an operator who cannot patch, rebuilding from source on a modern Ubuntu is a complete
+mitigation on its own.~~ **RETRACTED 2026-08-23.** That sentence stood here for a day and it was
+wrong. Full RELRO closes the *executable's* GOT and nothing else, and the executable's GOT is not the
+only writable code pointer in the process. A stock 0.8.1 server maps sixteen ELF images; five carry a
+writable `.got.plt`, and four of those five are distro libraries whose build flags the operator does
+not control. One of them, `libluajit-5.1-2`, is also reachable with an
+attacker-controlled first argument: `lua_pushstring` takes `strlen` of its own argument through that
+GOT, and `ProcessorChatMsg` hands it `player.chatMessage.c_str()`. `tes3mp-rce --via-luajit` runs the
+whole chain through it, and a live watch of both slots through a run shows the executable's
+`strlen@got` never changing. See `../../FULL-RELRO-BYPASS-RESULTS.md`.
+
+What survives is the weaker claim, which is still worth acting on: full RELRO removes the *cheapest*
+target and forces the attacker onto a library GOT and a longer packet sequence. It is real hardening
+and it is not a fix. The fix is bounding the index.
+
+For anyone writing a detector: testing whether `.got.plt`
 falls inside `GNU_RELRO` is **not sufficient**, because a full-RELRO link commonly emits no `.got.plt`
 section at all (eager binding leaves no lazy slots, so what remains folds into `.got`). The
 authoritative signal is `DT_BIND_NOW`, `DT_FLAGS & DF_BIND_NOW`, or `DT_FLAGS_1 & DF_1_NOW` in the
