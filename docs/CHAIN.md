@@ -37,12 +37,20 @@ writable `.got.plt`, and four of those five are distro libraries whose build fla
 not control. One of them, `libluajit-5.1-2`, is also reachable with an
 attacker-controlled first argument: `lua_pushstring` takes `strlen` of its own argument through that
 GOT, and `ProcessorChatMsg` hands it `player.chatMessage.c_str()`. `tes3mp-rce --via-luajit` runs the
-whole chain through it, and a live watch of both slots through a run shows the executable's
-`strlen@got` never changing. See `../../FULL-RELRO-BYPASS-RESULTS.md`.
+whole chain through it. This was then tested the only way that settles it: a server built from this
+same source with `-Wl,-z,relro,-z,now` (BIND_NOW, no `.got.plt` at all, `.got` inside `GNU_RELRO`,
+and a stack protector the release lacks), whose `strlen@got` reads `r--p` in the live process while
+libluajit's GOT page reads `rw-p` in that same process. **4 of 4 cold starts, marker each time.**
+See `../../FULL-RELRO-BYPASS-RESULTS.md`.
 
 What survives is the weaker claim, which is still worth acting on: full RELRO removes the *cheapest*
-target and forces the attacker onto a library GOT and a longer packet sequence. It is real hardening
+target and forces the attacker onto a library GOT and a tighter packet sequence. It is real hardening
 and it is not a fix. The fix is bounding the index.
+
+Worth knowing before recommending the rebuild at all: **stock 0.8.1 does not compile on Ubuntu 24.04**.
+`utf8stream.hpp` is missing a `<cstdint>` include, and both branches of the `#if` at
+`Script/Types.hpp:102` are rejected by current GCC and clang respectively. An operator taking this
+advice has to patch the tree before they can even try.
 
 For anyone writing a detector: testing whether `.got.plt`
 falls inside `GNU_RELRO` is **not sufficient**, because a full-RELRO link commonly emits no `.got.plt`
