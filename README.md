@@ -126,6 +126,13 @@ modes
 -s, --shell                 re-entry mode. Drives an ALREADY-INSTALLED backdoor as an ordinary
                             client; exploits nothing. Interactive, or one-shot with -c.
 -A, --account-pass <pw>     account password for -s (default: rce-poc-pw-1)
+    --via-luajit            Hijack strlen@got inside LIBLUAJIT instead of the executable's, for a
+                            server built with full RELRO. Full RELRO closes the executable's GOT and
+                            nothing else; the distro's libluajit-5.1-2 keeps a writable .got.plt, and
+                            lua_pushstring takes strlen of its own argument through it. ProcessorChatMsg
+                            hands that call player.chatMessage.c_str(), so the payload arrives as an
+                            ordinary chat message and the executable's GOT is never written.
+                            See ../FULL-RELRO-BYPASS-RESULTS.md.
 -O, --bot                   LOAD GENERATOR. Join a cell as an ordinary client and send in-bounds
                             equipment changes forever. Exploits nothing. Exists so a second
                             player's relays are present in the cell, which is the only way to
@@ -323,12 +330,18 @@ and Ubuntu 24.04's glibc 2.39. Against another build, re-measure:
 readelf -rW tes3mp-server.x86_64 | grep -E ' (strlen|malloc)@'   # GOT slots
 nm -D /lib/x86_64-linux-gnu/libc.so.6 | grep -wE 'system|malloc' # libc offsets
 # vtable RVA: attach gdb, `info symbol` the value the exploit reads at base-8
+
+# --via-luajit additionally needs, all public per-build data:
+readelf -rW tes3mp-server.x86_64 | grep ' lua_tolstring@'        # lua_probe_got
+nm -D /usr/lib/x86_64-linux-gnu/libluajit-5.1.so.2 | grep ' lua_tolstring$'   # lua_probe_off
+readelf -rW /usr/lib/x86_64-linux-gnu/libluajit-5.1.so.2 | grep ' strlen@'    # lua_strlen_got
 ```
 
 ## Status
 
 Demonstrated with a non-destructive marker payload, **5/5 cold starts** against a fresh server with fresh
-ASLR each run (`evidence/rce-and-reverse-shell.txt`). Five is the whole sample: it is enough to show the
+ASLR each run (`evidence/rce-and-reverse-shell.txt`). The `--via-luajit` route is a separate **6/6**,
+including one run on a profile derived entirely from the TES3MP headers. Five is the whole sample: it is enough to show the
 chain is not a fluke, not enough to put a number on the failure rate. Reliability was measured on an idle
 lab server; a busy server with competing packet traffic is untested and would be expected to degrade,
 since the grooming steps assume nothing else is churning the heap in between.

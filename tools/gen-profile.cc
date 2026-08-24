@@ -12,8 +12,13 @@
 //
 // BUILD (on a Linux box with the TES3MP tree; the ABI must match the TARGET, so building this on
 // macOS against libc++ produces wrong numbers and the assertions below will not catch it):
-//     clang++ -std=c++17 -I<TES3MP> -include cstdint -Wno-invalid-offsetof \
-//             tools/gen-profile.cc -o gen-profile
+//     clang++ -std=c++17 -I<TES3MP> -I<raknet/include/raknet> -include cstdint -Wno-invalid-offsetof \
+//             tools/gen-profile.cc -o gen-profile -L<raknet/lib> -lRakNetLibStatic -lpthread
+//
+// The raknet include and link flags are not optional: BasePlayer.hpp pulls in RakNetTypes.h, and
+// SystemAddress has an out-of-line constructor, so a header-only invocation fails at the link rather
+// than the compile. The line above without them is the one that was documented here, and it does not
+// build.
 //
 // offsetof on a non-standard-layout type is conditionally supported. GCC and Clang both implement
 // it correctly for this case, which is why -Wno-invalid-offsetof is a suppression rather than a
