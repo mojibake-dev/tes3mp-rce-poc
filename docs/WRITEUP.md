@@ -171,12 +171,39 @@ The fix is to lean on a value that is *not* page-aligned: `&malloc`, read from t
 `link_map`.
 
 That yields the libc *base*. `system`'s *offset within* libc is genuinely per-build (glibc patch
-levels shift symbols) and is the one number that must come from build metadata. It comes from a small
-table keyed on `malloc`'s offset (which we now compute remotely), populated from the distribution's
-own public `libc6` packages, never from the target. In this engagement the target's build,
-`2.39-0ubuntu8.7`, was identified and its `system` offset read straight out of the public package.
-Symbols in libraries this way are the modern equivalent of the old "libc database" fingerprinting
-approach [LIBCDB].
+levels shift symbols), and for a long time it was the one number that had to come from build
+metadata. It comes from a small table keyed on `malloc`'s offset (which we now compute remotely),
+populated from the distribution's own public `libc6` packages, never from the target. Identifying a
+build from a few symbol offsets this way is the modern form of the old "libc database" approach
+[LIBCDB].
+
+### Correction: the truncation was a speed bump, not a wall (MEASURED 2026-08-23)
+
+The paragraph above was written believing a page-aligned value is simply unreadable. That is true of
+a *single* read and false of the primitive as a whole, and the difference matters because the whole
+table exists to work around it.
+
+Read at `tgt + k` instead of `tgt`. A zero-length answer at offset `k` is not a failed read, it is
+the value of byte `k`, and the observed length says where the next NUL is. So each read either
+delivers a run of bytes or identifies one zero byte, and eight bytes come back in at most eight
+reads. Expressing that needs a read primitive that distinguishes "the relay arrived and the string
+was empty" from "no relay arrived", which the original did not: both returned 0.
+
+Demonstrated against a live server, on a value chosen so the old primitive cannot see it at all.
+`libc+9` spans `e_ident`'s padding and the low byte of `e_type`: seven zero bytes followed by `0x03`,
+`ET_DYN`.
+
+```
+[v] zero-low-byte probe at libc+9: shifted=0x300000000000000 (len 8), single read len=0
+[v]   NUL-TRANSPARENT: recovered ET_DYN behind seven zero bytes that a single read reports as empty
+```
+
+`len=0` is what the old read sees. So the `link_map` walk is not blocked after all: `l_addr` is a
+load base, its low byte is zero, and a value whose low byte is zero is now readable. The table is
+still what the chain *uses*, because resolving `system` from libc's own `.gnu.hash` costs tens of
+reads and the table costs none, but it is a performance choice now rather than the only option. The
+honest framing is that `system`'s offset is the one number this chain does not *bother* to derive,
+not the one number it cannot.
 
 ---
 

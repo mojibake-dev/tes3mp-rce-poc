@@ -32,9 +32,19 @@ LDLIBS    = -lRakNetLibStatic -lpthread
 BIN = tes3mp-rce
 SRC = src/tes3mp-rce.cc
 
+# Fetching and building CrabNet is a prerequisite ONLY when we are using our own copy of it.
+# Pointing RAKNET_LIBDIR or CRABNET_LIB at a tree that already exists must not trigger a clone,
+# and it used to: CRABNET_LIB kept its default under $(THIRD_PARTY) whatever else you passed, so
+# the order-only prerequisite fired and `make RAKNET_INC=... RAKNET_LIBDIR=...` -- the offline
+# invocation the README documents -- tried to reach github and failed on any dark network.
+CRABNET_DEP := $(CRABNET_LIB)
+ifneq ($(filter command line,$(origin RAKNET_LIBDIR) $(origin CRABNET_LIB)),)
+  CRABNET_DEP :=
+endif
+
 all: $(BIN)
 
-$(BIN): $(SRC) | $(CRABNET_LIB)
+$(BIN): $(SRC) | $(CRABNET_DEP)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(SRC) -o $@ $(LDFLAGS) $(LDLIBS)
 	@echo "built ./$(BIN) - run './$(BIN) --help'"
 

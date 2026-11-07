@@ -13,6 +13,51 @@ GNU_RELRO   0x2b5680 .. 0x2c3000       <- ends exactly where .got.plt begins
 JUMP_SLOT   301 entries
 ```
 
+### The RELRO line is a distro accident, not a decision (MEASURED 2026-08-23)
+
+TES3MP's `CMakeLists.txt` sets **no hardening flags at all** (only `-Wall -Wextra -Wundef -pedantic`,
+`:578`), so whether a given server is exposed is decided entirely by whose toolchain built it.
+Measured with a plain `g++ -O2` on a trivial file, no flags added, on the fuzz pool:
+
+| Host | Compiler | `GNU_RELRO` | `BIND_NOW` | `.got.plt` | Result |
+|---|---|---|---|---|---|
+| Ubuntu 24.04 | g++ 13 | yes | **yes** | **absent** | full RELRO: **executable GOT closed** |
+| Debian 12 | g++ 12 | yes | no | present | partial RELRO: **exposed** |
+| shipped 0.8.1 release | Debian GCC 8.3 | yes | no | present | partial RELRO: **exposed** |
+
+So the same source, built by two people on two current distributions, produces one server this chain
+cannot touch and one it owns. The shipped release binary is on the exposed side, which is the only
+reason any of this works.
+
+~~For an operator who cannot patch, rebuilding from source on a modern Ubuntu is a complete
+mitigation on its own.~~ **RETRACTED 2026-08-23.** That sentence stood here for a day and it was
+wrong. Full RELRO closes the *executable's* GOT and nothing else, and the executable's GOT is not the
+only writable code pointer in the process. A stock 0.8.1 server maps sixteen ELF images; five carry a
+writable `.got.plt`, and four of those five are distro libraries whose build flags the operator does
+not control. One of them, `libluajit-5.1-2`, is also reachable with an
+attacker-controlled first argument: `lua_pushstring` takes `strlen` of its own argument through that
+GOT, and `ProcessorChatMsg` hands it `player.chatMessage.c_str()`. `tes3mp-rce --via-luajit` runs the
+whole chain through it. This was then tested the only way that settles it: a server built from this
+same source with `-Wl,-z,relro,-z,now` (BIND_NOW, no `.got.plt` at all, `.got` inside `GNU_RELRO`,
+and a stack protector the release lacks), whose `strlen@got` reads `r--p` in the live process while
+libluajit's GOT page reads `rw-p` in that same process. **4 of 4 cold starts, marker each time.**
+See `../../FULL-RELRO-BYPASS-RESULTS.md`.
+
+What survives is the weaker claim, which I would still act on: full RELRO removes the *cheapest*
+target and forces the attacker onto a library GOT and a tighter packet sequence. It is hardening
+and it is not a fix. The fix is bounding the index.
+
+One thing to know before recommending the rebuild at all: **stock 0.8.1 does not compile on Ubuntu 24.04**.
+`utf8stream.hpp` is missing a `<cstdint>` include, and both branches of the `#if` at
+`Script/Types.hpp:102` are rejected by current GCC and clang respectively. An operator taking this
+advice has to patch the tree before they can even try.
+
+For anyone writing a detector: testing whether `.got.plt`
+falls inside `GNU_RELRO` is **not sufficient**, because a full-RELRO link commonly emits no `.got.plt`
+section at all (eager binding leaves no lazy slots, so what remains folds into `.got`). The
+authoritative signal is `DT_BIND_NOW`, `DT_FLAGS & DF_BIND_NOW`, or `DT_FLAGS_1 & DF_1_NOW` in the
+dynamic table. `tes3mp-rce --server-bin` checks those and refuses.
+
 PIE and NX are on (toolchain defaults). Stack canary, FORTIFY and full RELRO are absent. `system` is
 **not** imported, so it has to come from libc, which is why a libc leak is needed at all.
 
@@ -75,7 +120,7 @@ Planting a fake `std::string{_M_p = target, _M_len = 8}` into an equipment `refI
 client in the cell. The send path only **reads** `refId`, so the plant survives, and 8 bytes from `target`
 arrive at the other client.
 
-Two gotchas, both of which cost real time to find:
+Two gotchas, both of which cost time to find:
 
 * **The write used to plant is `strlen`-truncated.** The server does `chatMessage = rstr.C_String()`, so
   anything after an internal NUL is not written. Multi-byte values must be planted byte by byte.
