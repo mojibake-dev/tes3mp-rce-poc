@@ -2,8 +2,17 @@
 #
 #   make          build (fetches + builds CrabNet on first run, see `make deps`)
 #   make deps     clone + build the pinned CrabNet only
-#   make clean    remove the exploit binary
+#   make tools    build mk-control (gen-profile needs a TES3MP tree, see below)
+#   make clean    remove the built binaries
 #   make distclean  also remove third_party/CrabNet
+#
+# Retargeting a build other than stock 0.8.1 goes through tools/gen-profile, which derives
+# the class layout from a TES3MP source tree with offsetof rather than from measurement.
+# It needs headers this repo deliberately does not vendor, so it takes a path:
+#   make gen-profile TES3MP_SRC=/path/to/TES3MP
+# BasePlayer.hpp pulls components/esm, which pulls osg headers, so that tree's own build
+# dependencies have to be reachable. Pass more include paths with GEN_PROFILE_INC if they
+# are somewhere unusual.
 #
 # Everything needed is either vendored (third_party/tes3mp) or fetched at a pinned commit
 # (third_party/CrabNet), so a clean clone builds with no manual dependency hunting.
@@ -31,6 +40,10 @@ LDLIBS    = -lRakNetLibStatic -lpthread
 
 BIN = tes3mp-rce
 SRC = src/tes3mp-rce.cc
+
+# gen-profile compiles against a real TES3MP tree; mk-control only needs what we already have.
+TES3MP_SRC      ?=
+GEN_PROFILE_INC ?= $(if $(TES3MP_SRC),-I$(TES3MP_SRC))
 
 # Fetching and building CrabNet is a prerequisite ONLY when we are using our own copy of it.
 # Pointing RAKNET_LIBDIR or CRABNET_LIB at a tree that already exists must not trigger a clone,
@@ -100,10 +113,34 @@ $(CRABNET_LIB): | $(CRABNET_SRC)/.git
 	cmake --build $(CRABNET_SRC)/build --target RakNetLibStatic -j$(shell nproc 2>/dev/null || echo 4)
 	@test -f $@ || { echo "error: expected $@ after the CrabNet build"; exit 1; }
 
+tools: mk-control
+
+mk-control: tools/mk-control.cc | $(CRABNET_DEP)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS) $(LDLIBS)
+	@echo "built ./$@"
+
+# Deliberately NOT vendored. gen-profile's whole job is to report the layout of the tree you
+# point it at, so vendoring 0.8.1's headers would make it answer a question already answered by
+# the baked-in defaults. Worse, its own header warns that a mismatched ABI produces wrong numbers
+# that its assertions do not catch, so a stubbed osg::Vec3f would yield a confident wrong profile.
+# The raknet include and link flags are not optional: BasePlayer.hpp pulls RakNetTypes.h and
+# SystemAddress has an out-of-line constructor, so a header-only invocation fails at link.
+gen-profile: tools/gen-profile.cc | $(CRABNET_DEP)
+	@if [ -z "$(TES3MP_SRC)" ]; then \
+		echo "gen-profile needs the TES3MP source tree for the build you are targeting:"; \
+		echo "  make gen-profile TES3MP_SRC=/path/to/TES3MP"; \
+		echo "Build it where the target's ABI matches; numbers derived under a different"; \
+		echo "standard library are wrong and the tool cannot tell."; \
+		exit 2; \
+	fi
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(GEN_PROFILE_INC) -include cstdint -Wno-invalid-offsetof \
+		$< -o $@ $(LDFLAGS) $(LDLIBS)
+	@echo "built ./$@ - run './$@ <name> > target.profile', then './$(BIN) -F target.profile'"
+
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) mk-control gen-profile
 
 distclean: clean
 	rm -rf $(CRABNET_SRC)
 
-.PHONY: all deps clean distclean
+.PHONY: all deps tools clean distclean

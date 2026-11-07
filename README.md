@@ -90,13 +90,15 @@ make RAKNET_INC=/path/to/raknet/include/raknet \
 Other targets: `make deps` (dependencies only), `make clean`, `make distclean` (also removes
 `third_party/CrabNet`).
 
-### Targeting a different TES3MP version
+### Connect token and CrabNet pin for another release
 
+Getting on the wire at all needs two things to match the target release before any profile matters.
 The connect token passed with `-t` is `TES3MP_VERSION + TES3MP_PROTO_VERSION + commitHash`, built from
 `components/openmw-mp/Version.hpp` and the release commit. For 0.8.1 that is
 `"0.8.1"` + `10` + `68954091c54d0596037c4fb54d2812313b7582a1`, i.e. the default. For another release,
 re-read those three values, and re-pin CrabNet to whatever that release links
-(`make CRABNET_COMMIT=<sha>`).
+(`make CRABNET_COMMIT=<sha>`). The offsets that chain then needs are a separate step; see
+"Targeting a build other than stock 0.8.1" below.
 
 ## Use
 
@@ -320,10 +322,41 @@ other client.
 
 Fixing (1) alone breaks the chain at step 1.
 
-## Target profile
+## Targeting a build other than stock 0.8.1
 
-Constants in `Profile` (top of `src/tes3mp-rce.cc`) are measured against the distributed 0.8.1 Linux build
-and Ubuntu 24.04's glibc 2.39. Against another build, re-measure:
+A profile has two halves, and each is derived rather than measured.
+
+**The class layout** comes from the compiler. Three numbers the chain depends on are facts about a
+C++ class layout and are not recoverable from ELF metadata: where `equipmentItems` sits inside
+`BasePlayer`, how wide an `Item` is, and which two out-of-bounds indices land on the fields the chain
+needs. `tools/gen-profile` computes them with `offsetof` against the headers of the version you are
+targeting:
+
+```sh
+make gen-profile TES3MP_SRC=/path/to/TES3MP
+./gen-profile my-target > my-target.profile
+./tes3mp-rce -F my-target.profile <host>
+```
+
+Build it where the target's ABI matches. Numbers derived under a different standard library are
+wrong and the tool cannot detect that, which is the one failure mode it does not guard against. It
+does check that each index lands exactly on its field, so a layout that no longer supports the chain
+fails loudly rather than reading the wrong member.
+
+The headers are deliberately not vendored here. Vendoring 0.8.1's would make the tool report the
+layout this build already assumes, which is the question the baked-in defaults already answer.
+
+**The image and libc halves** come from the binaries themselves:
+
+```sh
+./tes3mp-rce -B /path/to/target/tes3mp-server.x86_64 \
+             -L /path/to/target/libc.so.6 <host>
+```
+
+`-B` reads the vtable and GOT RVAs, `-L` reads the `malloc` and `system` offsets. `-B` takes
+precedence over `-F` for the RVA half, because the binary is ground truth for its own addresses.
+
+If you would rather read them yourself, or need the `--via-luajit` slots:
 
 ```sh
 readelf -rW tes3mp-server.x86_64 | grep -E ' (strlen|malloc)@'   # GOT slots
@@ -335,6 +368,9 @@ readelf -rW tes3mp-server.x86_64 | grep ' lua_tolstring@'        # lua_probe_got
 nm -D /usr/lib/x86_64-linux-gnu/libluajit-5.1.so.2 | grep ' lua_tolstring$'   # lua_probe_off
 readelf -rW /usr/lib/x86_64-linux-gnu/libluajit-5.1.so.2 | grep ' strlen@'    # lua_strlen_got
 ```
+
+The constants in `Profile` at the top of `src/tes3mp-rce.cc` remain the defaults for the distributed
+0.8.1 Linux build against Ubuntu 24.04's glibc 2.39.
 
 ## Status
 
