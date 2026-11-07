@@ -87,8 +87,14 @@ make RAKNET_INC=/path/to/raknet/include/raknet \
      RAKNET_LIBDIR=/path/to/raknet/lib
 ```
 
-Other targets: `make deps` (dependencies only), `make clean`, `make distclean` (also removes
-`third_party/CrabNet`).
+Other targets: `make deps` (dependencies only), `make tools` (builds `mk-control`), `make clean`,
+`make distclean` (also removes `third_party/CrabNet`). `make gen-profile` takes a TES3MP tree and is
+covered under "Targeting a build other than stock 0.8.1" below.
+
+`mk-control` emits the known-positive control input for the F-001 out-of-bounds, built from the real
+packet-ID enum and BitStream rather than checked in as a blob, so it stays correct for whatever tree
+it is compiled against. A fuzzing campaign that stops rediscovering a bug you already reproduced
+makes every later "no crashes" result uninterpretable, and a blob cannot tell you why it stopped.
 
 ### Connect token and CrabNet pin for another release
 
@@ -143,7 +149,7 @@ modes
 
 target profile
 -F, --profile <file>        load a target profile: the class layout AND the image RVAs.
-                            tools/gen-profile derives the layout half from a TES3MP source tree
+                            tools/gen-profile.cc derives the layout half from a TES3MP tree
                             with offsetof, so a new build is a regenerate rather than a
                             re-measure. -B still wins for the RVA half, since the binary is
                             ground truth for its own addresses.
@@ -329,7 +335,7 @@ A profile has two halves, and each is derived rather than measured.
 **The class layout** comes from the compiler. Three numbers the chain depends on are facts about a
 C++ class layout and are not recoverable from ELF metadata: where `equipmentItems` sits inside
 `BasePlayer`, how wide an `Item` is, and which two out-of-bounds indices land on the fields the chain
-needs. `tools/gen-profile` computes them with `offsetof` against the headers of the version you are
+needs. `tools/gen-profile.cc` computes them with `offsetof` against the headers of the version you are
 targeting:
 
 ```sh
