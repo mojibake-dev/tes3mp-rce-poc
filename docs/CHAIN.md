@@ -43,11 +43,11 @@ and a stack protector the release lacks), whose `strlen@got` reads `r--p` in the
 libluajit's GOT page reads `rw-p` in that same process. **4 of 4 cold starts, marker each time.**
 See `../../FULL-RELRO-BYPASS-RESULTS.md`.
 
-What survives is the weaker claim, which is still worth acting on: full RELRO removes the *cheapest*
-target and forces the attacker onto a library GOT and a tighter packet sequence. It is real hardening
+What survives is the weaker claim, which I would still act on: full RELRO removes the *cheapest*
+target and forces the attacker onto a library GOT and a tighter packet sequence. It is hardening
 and it is not a fix. The fix is bounding the index.
 
-Worth knowing before recommending the rebuild at all: **stock 0.8.1 does not compile on Ubuntu 24.04**.
+One thing to know before recommending the rebuild at all: **stock 0.8.1 does not compile on Ubuntu 24.04**.
 `utf8stream.hpp` is missing a `<cstdint>` include, and both branches of the `#if` at
 `Script/Types.hpp:102` are rejected by current GCC and clang respectively. An operator taking this
 advice has to patch the tree before they can even try.
@@ -120,7 +120,7 @@ Planting a fake `std::string{_M_p = target, _M_len = 8}` into an equipment `refI
 client in the cell. The send path only **reads** `refId`, so the plant survives, and 8 bytes from `target`
 arrive at the other client.
 
-Two gotchas, both of which cost real time to find:
+Two gotchas, both of which cost time to find:
 
 * **The write used to plant is `strlen`-truncated.** The server does `chatMessage = rstr.C_String()`, so
   anything after an internal NUL is not written. Multi-byte values must be planted byte by byte.
